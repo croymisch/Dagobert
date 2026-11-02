@@ -232,6 +232,19 @@ public sealed class ConfigWindow : Window
       ImGui.EndTooltip();
     }
 
+    var autoPinchAfterRetainerProcessing = Plugin.Configuration.AutoPinchAfterRetainerProcessing;
+    if (ImGui.Checkbox("Auto Pinch after all retainers are processed", ref autoPinchAfterRetainerProcessing))
+    {
+      Plugin.Configuration.AutoPinchAfterRetainerProcessing = autoPinchAfterRetainerProcessing;
+      Plugin.Configuration.Save();
+    }
+    if (ImGui.IsItemHovered())
+    {
+      ImGui.BeginTooltip();
+      ImGui.SetTooltip("If enabled, Dagobert automatically starts Auto Pinch when AutoRetainer finishes processing all retainers.");
+      ImGui.EndTooltip();
+    }
+
     int defaultAmount = Plugin.Configuration.DefaultAmount;
     ImGui.BeginGroup();
     ImGui.Text("Default amount:");

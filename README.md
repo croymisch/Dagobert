@@ -62,6 +62,7 @@ Recommended timing values are around `3000-4000 ms` for the price check delay an
 | Option | Default | Description |
 | --- | --- | --- |
 | Retainer Selection | All enabled | Choose which retainers are included when using Auto Pinch from the retainer list. Open the retainer list in-game to populate or refresh this list. |
+| Auto Pinch after all retainers are processed | On | Automatically starts Auto Pinch when AutoRetainer finishes processing all retainers. |
 | Show errors in chat | On | Prints pinching errors and skipped items to chat. |
 | Show Price Adjustments | On | Prints detailed price changes to chat. |
 | Show Retainer Names | On | Prints each retainer name while pinching all retainers. |

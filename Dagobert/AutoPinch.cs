@@ -38,6 +38,9 @@ namespace Dagobert
     private bool _cachedPricesUseUniversalisDataCenterPrices;
     private int _universalisPriceRequestId;
     private bool _disposed;
+    private bool _autoRetainerStateCaptured;
+    private bool _previousAutoRetainerSuppressed;
+    private bool _previousMultiModeEnabled;
     private CancellationTokenSource? _universalisPriceRequestCts;
 
     public AutoPinch()
@@ -84,6 +87,8 @@ namespace Dagobert
     public void Dispose()
     {
       _disposed = true;
+      _taskManager.Abort();
+      FinishPinching();
       CancelUniversalisPriceRequest();
       _universalisPriceProvider.Dispose();
       Svc.AddonLifecycle.UnregisterListener(AddonEvent.PostSetup, RetainerSellPostSetup);
@@ -98,10 +103,13 @@ namespace Dagobert
         ClearCachedPricesIfUniversalisSettingChanged();
         DrawForRetainerList();
         DrawForRetainerSellList();
+        if (_autoRetainerStateCaptured && !_taskManager.IsBusy)
+          FinishPinching();
       }
       catch (Exception ex)
       {
         _taskManager.Abort();
+        FinishPinching();
         Svc.Log.Error(ex, "Error while auto pinching");
         if (Plugin.Configuration.ShowErrorsInChat)
           Svc.Chat.PrintError($"Error while auto pinching: {ex.Message}");
@@ -192,8 +200,7 @@ namespace Dagobert
         if (ImGui.Button("Cancel"))
         {
           _taskManager.Abort();
-          AutoRetainerIPC.Suppressed(false);
-          RemoveTalkAddonListeners();
+          FinishPinching();
         }
         if (ImGui.IsItemHovered())
         {
@@ -216,57 +223,124 @@ namespace Dagobert
       }
     }
 
+    public void StartPinchingRetainers()
+    {
+      Svc.Log.Information("AutoPinch start requested");
+      PinchAllRetainers();
+    }
+
+    public void StartPinchingRetainers(bool previousSuppressed, bool previousMultiModeEnabled)
+    {
+      Svc.Log.Information("AutoPinch start requested by AutoRetainer completion event");
+      PinchAllRetainers(previousSuppressed, previousMultiModeEnabled);
+    }
+
     private unsafe void PinchAllRetainers()
     {
+      PinchAllRetainers(null, null);
+    }
+
+    private unsafe void PinchAllRetainers(bool? previousSuppressed, bool? previousMultiModeEnabled)
+    {
       if (_taskManager.IsBusy)
+      {
+        Svc.Log.Warning("AutoPinch did not start because its task queue is already busy");
+        if (previousSuppressed.HasValue && previousMultiModeEnabled.HasValue)
+          RestoreAutoRetainerState(previousSuppressed.Value, previousMultiModeEnabled.Value);
         return;
+      }
   
       ClearState();
+      _previousAutoRetainerSuppressed = previousSuppressed ?? AutoRetainerIPC.Suppressed();
+      _previousMultiModeEnabled = previousMultiModeEnabled ?? AutoRetainerIPC.MultiModeEnabled();
+      _autoRetainerStateCaptured = true;
+      if (!previousSuppressed.HasValue || !previousMultiModeEnabled.HasValue)
+      {
+        var suppressionSet = AutoRetainerIPC.Suppressed(true);
+        var multiModeSet = AutoRetainerIPC.MultiModeEnabled(false);
+        if (!suppressionSet || !multiModeSet)
+        {
+          FinishPinching();
+          return;
+        }
+      }
+
       if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("RetainerList", out var addon) && GenericHelpers.IsAddonReady(addon))
       {
-        AutoRetainerIPC.Suppressed(true);
-
-        Svc.AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Talk", SkipRetainerDialog);
-        Svc.AddonLifecycle.RegisterListener(AddonEvent.PostUpdate, "Talk", SkipRetainerDialog);
-
-        // we cache the number of retainers because AddonMaster will be disposed once the RetainerList addon is closed.
-        var retainerList = new AddonMaster.RetainerList(addon);
-        var retainers = retainerList.Retainers;
-        var num = retainers.Length;
-        
-        // Check if all are disabled (sentinel present)
-        bool allDisabled = Plugin.Configuration.EnabledRetainerNames.Contains(Configuration.ALL_DISABLED_SENTINEL);
-        
-        // If all are disabled, skip all retainers and notify user
-        if (allDisabled)
-        {
-          Communicator.PrintAllRetainersDisabled();
-        }
-        else
-        {
-          // If no retainers are explicitly enabled, enable all by default
-          bool allEnabled = Plugin.Configuration.EnabledRetainerNames.Count == 0;
-          
-          for (int i = 0; i < num; i++)
-          {
-            var retainerName = retainers[i].Name;
-            
-            // Skip retainers that are excluded in configuration
-            if (!allEnabled && !Plugin.Configuration.EnabledRetainerNames.Contains(retainerName))
-            {
-              Svc.Log.Debug($"Skipping retainer '{retainerName}' (excluded by user configuration)");
-              continue;
-            }
-            EnqueueSingleRetainer(i);
-          }
-          
-          _taskManager.Enqueue(RemoveTalkAddonListeners);
-          if (Plugin.Configuration.TTSWhenAllDone)
-            _taskManager.Enqueue(() => SpeakTTS(Plugin.Configuration.TTSWhenAllDoneMsg), "SpeakTTSAll");
-        }
-
-        _taskManager.Enqueue(() => AutoRetainerIPC.Suppressed(false));
+        QueueRetainerPinch(addon);
       }
+      else
+      {
+        Svc.Log.Information("AutoPinch is waiting for the Retainer List addon to become ready");
+        _taskManager.Enqueue(WaitForRetainerList, 10000, "WaitForRetainerList");
+      }
+    }
+
+    private unsafe bool? WaitForRetainerList()
+    {
+      if (!GenericHelpers.TryGetAddonByName<AtkUnitBase>("RetainerList", out var addon) || !GenericHelpers.IsAddonReady(addon))
+        return false;
+
+      Svc.Log.Information("Retainer List is ready; queuing AutoPinch work");
+      QueueRetainerPinch(addon);
+      return true;
+    }
+
+    private unsafe void QueueRetainerPinch(AtkUnitBase* addon)
+    {
+      Svc.Log.Information($"AutoPinch started: suppressed={AutoRetainerIPC.Suppressed()}, MultiMode={AutoRetainerIPC.MultiModeEnabled()}");
+      Svc.AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Talk", SkipRetainerDialog);
+      Svc.AddonLifecycle.RegisterListener(AddonEvent.PostUpdate, "Talk", SkipRetainerDialog);
+
+      var retainerList = new AddonMaster.RetainerList(addon);
+      var retainers = retainerList.Retainers;
+      var retainerCount = retainers.Length;
+      var enqueuedRetainers = 0;
+
+      var allDisabled = Plugin.Configuration.EnabledRetainerNames.Contains(Configuration.ALL_DISABLED_SENTINEL);
+      if (allDisabled)
+      {
+        Communicator.PrintAllRetainersDisabled();
+      }
+      else
+      {
+        var allEnabled = Plugin.Configuration.EnabledRetainerNames.Count == 0;
+        for (var index = 0; index < retainerCount; index++)
+        {
+          var retainerName = retainers[index].Name;
+          if (!allEnabled && !Plugin.Configuration.EnabledRetainerNames.Contains(retainerName))
+          {
+            Svc.Log.Debug($"Skipping retainer '{retainerName}' (excluded by user configuration)");
+            continue;
+          }
+
+          EnqueueSingleRetainer(index);
+          enqueuedRetainers++;
+        }
+
+        _taskManager.Enqueue(RemoveTalkAddonListeners);
+        if (Plugin.Configuration.TTSWhenAllDone)
+          _taskManager.Enqueue(() => SpeakTTS(Plugin.Configuration.TTSWhenAllDoneMsg), "SpeakTTSAll");
+      }
+
+      _taskManager.Enqueue(FinishPinching);
+      Svc.Log.Information($"AutoPinch queued processing for {enqueuedRetainers} of {retainerCount} retainers");
+    }
+
+    private void FinishPinching()
+    {
+      RemoveTalkAddonListeners();
+      if (!_autoRetainerStateCaptured)
+        return;
+
+      _autoRetainerStateCaptured = false;
+      RestoreAutoRetainerState(_previousAutoRetainerSuppressed, _previousMultiModeEnabled);
+    }
+
+    private static void RestoreAutoRetainerState(bool suppressed, bool multiModeEnabled)
+    {
+      AutoRetainerIPC.MultiModeEnabled(multiModeEnabled);
+      AutoRetainerIPC.Suppressed(suppressed);
     }
 
     private void EnqueueSingleRetainer(int index)
@@ -291,8 +365,8 @@ namespace Dagobert
         ECommons.Automation.Callback.Fire(addon, true, 2, index);
         return true;
       }
-      else
-        return false;
+
+      return false;
     }
 
     private static unsafe bool? ClickSellItems()
@@ -302,8 +376,8 @@ namespace Dagobert
         new AddonMaster.SelectString(addon).Entries[2].Select();
         return true;
       }
-      else
-        return false;
+
+      return false;
     }
 
     private static unsafe bool? CloseRetainerSellList()
@@ -313,8 +387,8 @@ namespace Dagobert
         addon->Close(true);
         return true;
       }
-      else
-        return false;
+
+      return false;
     }
 
     private static unsafe bool? CloseRetainer()
@@ -324,8 +398,8 @@ namespace Dagobert
         addon->Close(true);
         return true;
       }
-      else
-        return false;
+
+      return false;
     }
 
     private unsafe void PinchAllRetainerItems()
@@ -344,28 +418,25 @@ namespace Dagobert
       {
         var listNode = (AtkComponentNode*)addon->UldManager.NodeList[10];
         var listComponent = (AtkComponentList*)listNode->Component;
-        int num = listComponent->ListLength;
+        var itemCount = listComponent->ListLength;
         if (reverseOrder)
         {
-          for (int i = num - 1; i >= 0; i--)
-          {
-            enqueueFunc(i);
-          }
+          for (var index = itemCount - 1; index >= 0; index--)
+            enqueueFunc(index);
         }
         else
         {
-          for (int i = 0; i < num; i++)
-          {
-            enqueueFunc(i);
-          }
+          for (var index = 0; index < itemCount; index++)
+            enqueueFunc(index);
         }
+
         if (Plugin.Configuration.TTSWhenEachDone)
           _taskManager.Enqueue(() => SpeakTTS(Plugin.Configuration.TTSWhenEachDoneMsg), "SpeakTTSEach");
 
         return true;
       }
-      else
-        return false;
+
+      return false;
     }
 
     private void EnqueueSingleItem(int index)
@@ -473,7 +544,6 @@ namespace Dagobert
 
       if (GenericHelpers.TryGetAddonByName<AddonRetainerSell>("RetainerSell", out var addon) && GenericHelpers.IsAddonReady(&addon->AtkUnitBase))
       {
-        // if we have a cached price, dont click compare
         var itemName = GetRetainerSellItemName(addon);
         var rawItemName = GetRetainerSellRawItemName(addon);
         if (_cachedPrices.TryGetValue(itemName, out var cachedPrice) && cachedPrice.Value > 0)
@@ -483,19 +553,17 @@ namespace Dagobert
           _newPriceFromUniversalis = cachedPrice.FromUniversalis;
           return true;
         }
-        else
-        {
-          if (Plugin.Configuration.UseUniversalisDataCenterPrices && _universalisPriceProvider.CanResolveItem(itemName, rawItemName))
-          {
-            Svc.Log.Debug($"{itemName}: requesting Universalis data center price");
-            StartUniversalisPriceRequest(itemName, rawItemName);
-            return true;
-          }
 
-          Svc.Log.Debug($"Clicking compare prices");
-          ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 4);
+        if (Plugin.Configuration.UseUniversalisDataCenterPrices && _universalisPriceProvider.CanResolveItem(itemName, rawItemName))
+        {
+          Svc.Log.Debug($"{itemName}: requesting Universalis data center price");
+          StartUniversalisPriceRequest(itemName, rawItemName);
           return true;
         }
+
+        Svc.Log.Debug("Clicking compare prices");
+        ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 4);
+        return true;
       }
 
       return false;
@@ -511,7 +579,6 @@ namespace Dagobert
         if (!_newPrice.HasValue)
           return false;
 
-        // close compare price window
         if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("ItemSearchResult", out var addon))
           addon->Close(true);
 
@@ -526,14 +593,15 @@ namespace Dagobert
             {
               Svc.Log.Warning("SetNewPrice: No price to set");
               Communicator.PrintNoPriceToSetError(itemName);
-              ECommons.Automation.Callback.Fire(&retainerSell->AtkUnitBase, true, 1); // cancel
+              ECommons.Automation.Callback.Fire(&retainerSell->AtkUnitBase, true, 1);
               ui->Close(true);
               return true;
             }
-	    Svc.Log.Warning("SetNewPrice: Using default amount");
+
+            Svc.Log.Warning("SetNewPrice: Using default amount");
             _newPrice = Plugin.Configuration.DefaultAmount;
             _newPriceFromUniversalis = false;
-	    Communicator.PrintUsingDefaultAmountWarning(itemName, _newPrice.Value);
+            Communicator.PrintUsingDefaultAmountWarning(itemName, _newPrice.Value);
           }
 
           var rawItemName = GetRetainerSellRawItemName(retainerSell);
@@ -547,21 +615,22 @@ namespace Dagobert
           var cutPercentage = ((float)_newPrice.Value - _oldPrice.Value) / _oldPrice.Value * 100f;
           if (cutPercentage >= -Plugin.Configuration.MaxUndercutPercentage)
           {
-            Svc.Log.Debug($"Setting new price");
+            Svc.Log.Debug("Setting new price");
             _cachedPrices.TryAdd(itemName, new CachedPrice(_newPrice.Value, _newPriceFromUniversalis));
             retainerSell->AskingPrice->SetValue(_newPrice.Value);
             Communicator.PrintPriceUpdate(itemName, _oldPrice.Value, _newPrice.Value, cutPercentage, _newPriceFromUniversalis);
           }
           else
+          {
             Communicator.PrintAboveMaxCutError(itemName);
+          }
 
-          ECommons.Automation.Callback.Fire(&retainerSell->AtkUnitBase, true, 0); // confirm
+          ECommons.Automation.Callback.Fire(&retainerSell->AtkUnitBase, true, 0);
           ui->Close(true);
-
           return true;
         }
-        else
-          return false;
+
+        return false;
       }
       finally
       {

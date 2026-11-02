@@ -59,6 +59,7 @@ public sealed class Plugin : IDalamudPlugin
     ECommonsMain.Init(PluginInterface, this);
     _autoPinch = new AutoPinch();
     WindowSystem.AddWindow(_autoPinch);
+    AutoRetainerIPC.RetainerProcessingCompleted += OnRetainerProcessingCompleted;
     AutoRetainerIPC.Initialize();
   }
 
@@ -68,7 +69,33 @@ public sealed class Plugin : IDalamudPlugin
     _autoPinch.Dispose();
     CommandManager.RemoveHandler("/dagobert");
     ContextMenu.OnMenuOpened -= OnContextMenuOpened;
+    AutoRetainerIPC.RetainerProcessingCompleted -= OnRetainerProcessingCompleted;
+    AutoRetainerIPC.Dispose();
     ECommonsMain.Dispose();
+  }
+
+  private void OnRetainerProcessingCompleted()
+  {
+    if (!Configuration.AutoPinchAfterRetainerProcessing)
+    {
+      Svc.Log.Information("AutoRetainer finished processing retainers; automatic AutoPinch is disabled");
+      return;
+    }
+
+    Svc.Log.Information("Dagobert received AutoRetainer's retainer-processing-completed event; requesting AutoPinch start");
+    var wasSuppressed = AutoRetainerIPC.Suppressed();
+    var wasMultiModeEnabled = AutoRetainerIPC.MultiModeEnabled();
+    var suppressionSet = AutoRetainerIPC.Suppressed(true);
+    var multiModeSet = AutoRetainerIPC.MultiModeEnabled(false);
+    Svc.Log.Information($"Pausing AutoRetainer for AutoPinch: suppressed={AutoRetainerIPC.Suppressed()}, MultiMode={AutoRetainerIPC.MultiModeEnabled()}");
+    if (!suppressionSet || !multiModeSet)
+    {
+      AutoRetainerIPC.MultiModeEnabled(wasMultiModeEnabled);
+      AutoRetainerIPC.Suppressed(wasSuppressed);
+      Svc.Log.Error($"AutoPinch was not started because AutoRetainer could not be paused (suppressedSet={suppressionSet}, multiModeSet={multiModeSet})");
+      return;
+    }
+    _autoPinch.StartPinchingRetainers(wasSuppressed, wasMultiModeEnabled);
   }
 
   private void OnDagobertCommand(string command, string args)
