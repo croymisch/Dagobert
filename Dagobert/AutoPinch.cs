@@ -1,10 +1,8 @@
 ﻿using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
-using Dalamud.Game.ClientState.Keys;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using ECommons;
-using ECommons.Automation;
 using ECommons.Automation.LegacyTaskManager;
 using ECommons.DalamudServices;
 using ECommons.ImGuiMethods;
@@ -22,7 +20,6 @@ using System.Speech.Synthesis;
 using System.Threading;
 using System.Threading.Tasks;
 using System.IO;
-using Dalamud.Game.Text.SeStringHandling;
 using static ECommons.UIHelpers.AtkReaderImplementations.ReaderContextMenu;
 
 namespace Dagobert
@@ -974,14 +971,57 @@ namespace Dagobert
       string itemName,
       int price)
     {
-      if (_currentAutoSellItemId.HasValue)
-        _autoSellSkippedItemIds.Add(_currentAutoSellItemId.Value);
+      var freeInventorySlots = GetFreeInventorySlotCount();
+      if (freeInventorySlots <= 1)
+      {
+        Svc.Log.Warning(
+          $"{itemName}: price {price} is below the minimum listing price {Plugin.Configuration.MinimumAutoSellPrice}, but it will remain listed because only {freeInventorySlots} inventory slots are free");
+        CancelCurrentRetainerSale(retainerSell);
+        return;
+      }
 
       Svc.Log.Information(
-        $"{itemName}: price {price} is below the minimum listing price {Plugin.Configuration.MinimumAutoSellPrice}; removing it from sale and returning it to inventory");
+        $"{itemName}: price {price} is below the minimum listing price {Plugin.Configuration.MinimumAutoSellPrice}; removing this retainer's listing and returning it to inventory");
       var isHq = itemName.Contains('\uE03C') || GetRetainerSellRawItemName(retainerSell).Contains('\uE03C');
       CancelCurrentRetainerSale(retainerSell);
       QueueRetainerListingRetrieval(itemName, _currentAutoSellItemId, isHq);
+    }
+
+    private static unsafe int GetFreeInventorySlotCount()
+    {
+      var inventoryManager = InventoryManager.Instance();
+      if (inventoryManager == null)
+      {
+        Svc.Log.Warning("Could not inspect inventory space before returning a retainer item; retrieval will be skipped");
+        return 0;
+      }
+
+      var freeSlots = 0;
+      InventoryType[] inventoryTypes =
+      [
+        InventoryType.Inventory1,
+        InventoryType.Inventory2,
+        InventoryType.Inventory3,
+        InventoryType.Inventory4,
+      ];
+
+      foreach (var inventoryType in inventoryTypes)
+      {
+        var container = inventoryManager->GetInventoryContainer(inventoryType);
+        if (container == null)
+        {
+          Svc.Log.Warning($"Could not inspect {inventoryType} before returning a retainer item; retrieval will be skipped");
+          return 0;
+        }
+
+        for (var slotIndex = 0; slotIndex < container->GetSize(); slotIndex++)
+        {
+          if (container->GetInventorySlot(slotIndex)->GetItemId() == 0)
+            freeSlots++;
+        }
+      }
+
+      return freeSlots;
     }
 
     private static unsafe void CancelCurrentRetainerSale(AddonRetainerSell* retainerSell)
