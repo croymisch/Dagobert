@@ -19,6 +19,7 @@ namespace Dagobert
     private bool _newRequest;
     private bool _useHq;
     private bool _itemHq;
+    private bool _itemLevelOneEquippable;
     private int _lastRequestId = UnknownRequestId;
     private int _pendingNoMatchRequestId = UnknownRequestId;
     private long _pendingNoMatchTimeoutAt;
@@ -36,6 +37,14 @@ namespace Dagobert
     private int _newPrice;
 
     public event EventHandler<NewPriceEventArgs>? NewPriceReceived;
+
+    public void SetCurrentItemForPriceCheck(uint itemId, bool isHq)
+    {
+      _itemHq = isHq;
+      _itemLevelOneEquippable = ItemNameResolver.IsLevelOneEquippable(itemId);
+      if (_itemLevelOneEquippable)
+        Svc.Log.Debug($"Item {itemId} is equippable at item level 1; market-board price check will include HQ and NQ listings");
+    }
 
     public MarketBoardHandler()
     {
@@ -133,7 +142,7 @@ namespace Dagobert
     private void ItemSearchResultPostSetup(AddonEvent type, AddonArgs args)
     {
       _newRequest = true;
-      _useHq = Plugin.Configuration.HQ && _itemHq;
+      _useHq = Plugin.Configuration.HQ && _itemHq && !_itemLevelOneEquippable;
       ClearPendingNoMatch();
       _pendingNoOfferingsTimeoutAt = Environment.TickCount64 + GetMarketBoardResultTimeoutMs();
     }
@@ -142,6 +151,9 @@ namespace Dagobert
     {
       string nodeText = ((AddonRetainerSell*)args.Addon.Address)->ItemName->NodeText.ToString();
       _itemHq = nodeText.Contains('\uE03C');
+      _itemLevelOneEquippable =
+        ItemNameResolver.TryGetItemId(nodeText, nodeText, out var itemId)
+        && ItemNameResolver.IsLevelOneEquippable(itemId);
     }
 
     public void PopulateRetainerCache()

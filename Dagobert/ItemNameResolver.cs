@@ -32,6 +32,18 @@ internal static class ItemNameResolver
     return $"Unknown item ({itemId})";
   }
 
+  public static bool CanStack(uint itemId)
+  {
+    return Items.Value.TryGetRow(itemId, out var item) && item.StackSize > 1;
+  }
+
+  public static bool IsLevelOneEquippable(uint itemId)
+  {
+    return Items.Value.TryGetRow(itemId, out var item)
+           && item.LevelItem.RowId == 1
+           && item.EquipSlotCategory.RowId != 0;
+  }
+
   private static uint ResolveItemId(string normalizedItemName, string rawItemName)
   {
     var exactMatch = Items.Value

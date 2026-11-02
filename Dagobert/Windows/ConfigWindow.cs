@@ -245,6 +245,38 @@ public sealed class ConfigWindow : Window
       ImGui.EndTooltip();
     }
 
+    var enableAutoSelling = Plugin.Configuration.EnableAutoSelling;
+    if (ImGui.Checkbox("Automatically sell protected items during Auto Pinch", ref enableAutoSelling))
+    {
+      Plugin.Configuration.EnableAutoSelling = enableAutoSelling;
+      Plugin.Configuration.Save();
+    }
+    if (ImGui.IsItemHovered())
+    {
+      ImGui.BeginTooltip();
+      ImGui.SetTooltip("When enabled, Auto Pinch only lists items on AutoRetainer's protection list and only when their price meets the minimum.");
+      ImGui.EndTooltip();
+    }
+
+    int minimumAutoSellPrice = Plugin.Configuration.MinimumAutoSellPrice;
+    ImGui.BeginGroup();
+    ImGui.Text("Minimum item price to sell:");
+    ImGui.SameLine();
+    if (ImGui.InputInt("##minimumAutoSellPrice", ref minimumAutoSellPrice))
+    {
+      Plugin.Configuration.MinimumAutoSellPrice = Math.Max(minimumAutoSellPrice, 0);
+      Plugin.Configuration.Save();
+    }
+    ImGui.SameLine();
+    ImGui.Text("Gil");
+    ImGui.EndGroup();
+    if (ImGui.IsItemHovered())
+    {
+      ImGui.BeginTooltip();
+      ImGui.SetTooltip("Every non-stackable item priced below this amount is left in inventory and skipped for the rest of the Auto Pinch run. Only protected items can be automatically listed.");
+      ImGui.EndTooltip();
+    }
+
     int defaultAmount = Plugin.Configuration.DefaultAmount;
     ImGui.BeginGroup();
     ImGui.Text("Default amount:");

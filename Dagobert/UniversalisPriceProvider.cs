@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace Dagobert;
 
@@ -23,37 +24,88 @@ internal sealed class UniversalisPriceProvider : IDisposable
 
   public bool CanResolveItem(string itemName, string rawItemName) => TryGetItem(itemName, rawItemName, out _, out _);
 
-  public async Task<int> GetNewPrice(string itemName, string rawItemName, CancellationToken cancellationToken)
+  public async Task<UniversalisPriceResult?> GetPrices(string itemName, string rawItemName, int currentPrice, CancellationToken cancellationToken)
   {
     if (!TryGetItem(itemName, rawItemName, out var itemId, out var hqOnly))
     {
       Svc.Log.Warning($"Could not resolve item id for Universalis price check: {NormalizeItemName(itemName)}");
-      return -1;
+      return null;
     }
 
     var dataCenterName = Svc.Objects.LocalPlayer?.CurrentWorld.ValueNullable?.DataCenter.ValueNullable?.Name.ToString();
     if (string.IsNullOrWhiteSpace(dataCenterName))
     {
       Svc.Log.Warning("Could not resolve current data center for Universalis price check");
-      return -1;
+      return null;
     }
 
     var marketData = await _client.GetMarketData(itemId, dataCenterName, hqOnly, cancellationToken).ConfigureAwait(false);
     if (!marketData.HasData || marketData.Listings.Count == 0)
-      return -1;
+      return null;
 
     var listing = marketData.Listings
       .Where(listing => listing.PricePerUnit > 0 && (!hqOnly || listing.Hq))
       .OrderBy(listing => listing.PricePerUnit)
-      .FirstOrDefault();
+      .FirstOrDefault(listing => listing.PricePerUnit != currentPrice);
 
     if (listing == null)
-      return -1;
+      return null;
 
     var ownRetainer = ulong.TryParse(listing.RetainerId, out var retainerId)
                       && Plugin.Configuration.SeenRetainers.Contains(retainerId);
     Svc.Log.Debug($"Universalis lowest data center price: {listing.PricePerUnit} on {listing.WorldName ?? dataCenterName}");
-    return CalculateNewPrice(listing.PricePerUnit, ownRetainer);
+    return new UniversalisPriceResult(listing.PricePerUnit, CalculateNewPrice(listing.PricePerUnit, ownRetainer));
+  }
+
+  public async Task<Dictionary<UniversalisItemKey, List<UniversalisPriceResult>>> GetPrices(
+    IReadOnlyCollection<RetainerMarketItem> items,
+    CancellationToken cancellationToken)
+  {
+    var worldName = Svc.Objects.LocalPlayer?.CurrentWorld.ValueNullable?.Name.ToString();
+    if (string.IsNullOrWhiteSpace(worldName))
+      throw new InvalidOperationException("Could not resolve current world for Universalis batch price check.");
+
+    var itemIds = items.Select(item => item.ItemId).Where(itemId => itemId != 0).Distinct().ToArray();
+    if (itemIds.Length == 0)
+      return [];
+
+    Svc.Log.Information($"Refreshing Universalis prices for {itemIds.Length} catalog items on world {worldName}");
+    var marketDataByItemId = await _client.GetMarketData(itemIds, worldName, cancellationToken).ConfigureAwait(false);
+    var prices = new Dictionary<UniversalisItemKey, List<UniversalisPriceResult>>();
+
+    foreach (var item in items)
+    {
+      if (!marketDataByItemId.TryGetValue(item.ItemId, out var marketData)
+          || !marketData.HasData
+          || marketData.Listings.Count == 0)
+        continue;
+
+      var levelOneEquippable = ItemNameResolver.IsLevelOneEquippable(item.ItemId);
+      var hqOnly = Plugin.Configuration.HQ && item.IsHq && !levelOneEquippable;
+      if (levelOneEquippable)
+        Svc.Log.Debug($"Item {item.ItemId} is equippable at item level 1; Universalis batch pricing will include HQ and NQ listings");
+      var listings = marketData.Listings
+        .Where(candidate => candidate.PricePerUnit > 0 && (!hqOnly || candidate.Hq))
+        .OrderBy(candidate => candidate.PricePerUnit)
+        .ToArray();
+      if (listings.Length == 0)
+        continue;
+
+      var key = new UniversalisItemKey(item.ItemId, hqOnly);
+      prices[key] = listings
+        .Select(listing =>
+        {
+          var ownRetainer = ulong.TryParse(listing.RetainerId, out var retainerId)
+                            && Plugin.Configuration.SeenRetainers.Contains(retainerId);
+          return new UniversalisPriceResult(
+            listing.PricePerUnit,
+            CalculateNewPrice(listing.PricePerUnit, ownRetainer));
+        })
+        .ToList();
+    }
+
+    Svc.Log.Information($"Universalis batch price refresh completed: {prices.Count} item qualities priced on world {worldName}");
+    return prices;
   }
 
   public void Dispose()
@@ -70,7 +122,10 @@ internal sealed class UniversalisPriceProvider : IDisposable
     if (itemId == 0)
       itemId = ResolveItemId(normalizedItemName, rawItemName);
 
-    hqOnly = Plugin.Configuration.HQ && itemHq;
+    var levelOneEquippable = ItemNameResolver.IsLevelOneEquippable(itemId);
+    hqOnly = Plugin.Configuration.HQ && itemHq && !levelOneEquippable;
+    if (levelOneEquippable)
+      Svc.Log.Debug($"Item {itemId} is equippable at item level 1; Universalis pricing will include HQ and NQ listings");
     return itemId != 0;
   }
 
@@ -127,3 +182,7 @@ internal sealed class UniversalisPriceProvider : IDisposable
     return normalizedItemName;
   }
 }
+
+internal readonly record struct UniversalisPriceResult(long LowestListingPrice, int SuggestedPrice);
+
+internal readonly record struct UniversalisItemKey(uint ItemId, bool HqOnly);

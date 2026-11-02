@@ -2,6 +2,7 @@
 using ECommons.DalamudServices;
 using ECommons.EzIpcManager;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace Dagobert
@@ -14,6 +15,39 @@ namespace Dagobert
         public const string OnRetainerListCustomTask = "AutoRetainer.OnRetainerListCustomTask";
         private const string RetainerProcessingCompletedIpc = "AutoRetainer.OnRetainerProcessingCompleted";
         public static bool Installed => Svc.PluginInterface.InstalledPlugins.Any(x => (x.InternalName == Name || x.InternalName == PlusName) && x.IsLoaded);
+
+        public static bool TryGetProtectionList(out HashSet<uint> itemIds)
+        {
+            itemIds = [];
+            var pluginName = Svc.PluginInterface.InstalledPlugins
+                .FirstOrDefault(x => (x.InternalName == Name || x.InternalName == PlusName) && x.IsLoaded)
+                ?.InternalName;
+            if (pluginName == null)
+            {
+                Svc.Log.Error("Cannot retrieve AutoRetainer's protection list because AutoRetainer is not loaded");
+                return false;
+            }
+
+            try
+            {
+                var protectionList = Svc.PluginInterface
+                    .GetIpcSubscriber<List<uint>>($"{pluginName}.PluginState.GetProtectionList")
+                    .InvokeFunc();
+                if (protectionList == null)
+                {
+                    Svc.Log.Error($"AutoRetainer ({pluginName}) returned a null protection list");
+                    return false;
+                }
+
+                itemIds = [.. protectionList.Where(itemId => itemId != 0).Distinct()];
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Svc.Log.Error(ex, "Failed to retrieve AutoRetainer's protection list");
+                return false;
+            }
+        }
 
         private static AutoRetainerIPC? _instance;
         public static AutoRetainerIPC? Instance => _instance;
