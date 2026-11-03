@@ -49,6 +49,8 @@ namespace Dagobert
     private bool _currentAutoSellItemCanStack;
     private bool _currentPriceUsingUniversalis;
     private int _marketBoardPriceCheckAttempts;
+    private bool _marketBoardResponseReceived;
+    private bool _usingUniversalisNoListingFallback;
     private UniversalisPriceResult? _universalisPriceResult;
     private Dictionary<UniversalisItemKey, List<UniversalisPriceResult>> _bulkUniversalisPrices = [];
     private CancellationTokenSource? _bulkUniversalisRequestCts;
@@ -68,7 +70,7 @@ namespace Dagobert
     private int _nextInventorySaleItemIndex;
     private bool _processingInventorySaleItem;
     private bool _inventorySaleExpectedCountIncremented;
-    private bool _inventoryUniversalisFallbackAttempted;
+    private bool _noListingUniversalisFallbackAttempted;
     private Dictionary<(uint ItemId, bool IsHq), RetainerMarketItem> _currentRetainerObservedItems = [];
     private bool _currentRetainerCatalogSyncComplete;
     private int _currentRetainerListingIndex = -1;
@@ -903,6 +905,8 @@ namespace Dagobert
         _newPriceFromUniversalis = false;
         _universalisPriceResult = null;
         _currentPriceUsingUniversalis = false;
+        _marketBoardResponseReceived = false;
+        _usingUniversalisNoListingFallback = false;
         _currentPriceRequestStartedAt = Environment.TickCount64;
         if (!_processingInventorySaleItem
             && _bulkPriceWorkflow
@@ -968,7 +972,7 @@ namespace Dagobert
 
         if (!_newPrice.HasValue)
         {
-          var requestTimeout = _inventoryUniversalisFallbackAttempted
+          var requestTimeout = _noListingUniversalisFallbackAttempted
             ? BulkPriceRequestTimeoutMS
             : PriceRequestTimeoutMS;
           if (!_currentPriceUsingUniversalis)
@@ -1031,6 +1035,7 @@ namespace Dagobert
           if (_autoPinchRun
               && !_processingInventorySaleItem
               && _currentPriceUsingUniversalis
+              && !_usingUniversalisNoListingFallback
               && _universalisPriceResult.HasValue
               && _oldPrice.Value <= _universalisPriceResult.Value.LowestListingPrice)
           {
@@ -1059,11 +1064,11 @@ namespace Dagobert
               && TryRetryMarketBoardPriceCheck(itemName))
             return true;
 
-          if (_newPrice.Value <= 0 && (isHq || _processingInventorySaleItem))
+          if (_newPrice.Value <= 0)
           {
-            if (!_inventoryUniversalisFallbackAttempted)
+            if (!_noListingUniversalisFallbackAttempted)
             {
-              _inventoryUniversalisFallbackAttempted = true;
+              _noListingUniversalisFallbackAttempted = true;
               StartUniversalisNoListingFallback(itemName, rawItemName, isHq);
               return false;
             }
@@ -1392,6 +1397,7 @@ namespace Dagobert
       _newPrice = e.NewPrice;
       _marketBoardLowestNqListingPrice = e.LowestNqListingPrice;
       _newPriceFromUniversalis = false;
+      _marketBoardResponseReceived = e.MarketBoardResponseReceived;
     }
 
     private unsafe bool TryRetryMarketBoardPriceCheck(string itemName)
@@ -1399,6 +1405,7 @@ namespace Dagobert
       if (!_autoPinchRun
           || _currentPriceUsingUniversalis
           || _newPriceFromUniversalis
+          || _marketBoardResponseReceived
           || _marketBoardPriceCheckAttempts == 0
           || _marketBoardPriceCheckAttempts >= MaximumMarketBoardPriceCheckAttempts)
         return false;
@@ -1910,6 +1917,7 @@ namespace Dagobert
       _newPrice = null;
       _newPriceFromUniversalis = false;
       _currentPriceUsingUniversalis = true;
+      _usingUniversalisNoListingFallback = true;
       _universalisPriceResult = null;
       _currentPriceRequestStartedAt = Environment.TickCount64;
       _universalisPriceRequestCts = new CancellationTokenSource();
@@ -2023,9 +2031,11 @@ namespace Dagobert
       _skipCurrentItem = false;
       _currentAutoSellItemId = null;
       _currentAutoSellItemCanStack = false;
-      _inventoryUniversalisFallbackAttempted = false;
+      _noListingUniversalisFallbackAttempted = false;
       _currentPriceUsingUniversalis = false;
       _marketBoardPriceCheckAttempts = 0;
+      _marketBoardResponseReceived = false;
+      _usingUniversalisNoListingFallback = false;
       _universalisPriceResult = null;
       _currentPriceRequestStartedAt = 0;
     }
@@ -2139,7 +2149,7 @@ namespace Dagobert
       _nextInventorySaleItemIndex = 0;
       _processingInventorySaleItem = false;
       _inventorySaleExpectedCountIncremented = false;
-      _inventoryUniversalisFallbackAttempted = false;
+      _noListingUniversalisFallbackAttempted = false;
     }
 
     private void ClearCachedPricesIfUniversalisSettingChanged()

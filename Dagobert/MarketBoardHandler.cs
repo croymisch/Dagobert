@@ -1,6 +1,7 @@
 ﻿using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Network.Structures;
+using ECommons;
 using ECommons.DalamudServices;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -20,6 +21,7 @@ namespace Dagobert
     private bool _useHq;
     private bool _itemHq;
     private bool _itemLevelOneEquippable;
+    private bool _marketBoardResponseReceived;
     private long? _lowestNqListingPrice;
     private int _lastRequestId = UnknownRequestId;
     private int _pendingNoMatchRequestId = UnknownRequestId;
@@ -32,7 +34,9 @@ namespace Dagobert
       set
       {
         _newPrice = value;
-        NewPriceReceived?.Invoke(this, new NewPriceEventArgs(NewPrice, _lowestNqListingPrice));
+        NewPriceReceived?.Invoke(
+          this,
+          new NewPriceEventArgs(NewPrice, _lowestNqListingPrice, _marketBoardResponseReceived));
         _lowestNqListingPrice = null;
       }
     }
@@ -147,8 +151,17 @@ namespace Dagobert
 
       if (_pendingNoOfferingsTimeoutAt > 0 && now >= _pendingNoOfferingsTimeoutAt)
       {
-        Svc.Log.Debug("No market board offerings received before timeout");
-        CompletePriceRequest(-1, UnknownRequestId);
+        var emptySearchResults =
+          GenericHelpers.TryGetAddonByName<AddonItemSearchResult>("ItemSearchResult", out var searchResult)
+          && GenericHelpers.IsAddonReady(&searchResult->AtkUnitBase)
+          && searchResult->Results != null
+          && searchResult->Results->GetItemCount() == 0;
+        if (emptySearchResults)
+          Svc.Log.Information("Market Board search completed with no listings; skipping price-check retries");
+        else
+          Svc.Log.Debug("No market board offerings received before timeout");
+
+        CompletePriceRequest(-1, UnknownRequestId, marketBoardResponseReceived: emptySearchResults);
       }
     }
 
@@ -193,13 +206,14 @@ namespace Dagobert
 
     private static int GetMarketBoardResultTimeoutMs() => Math.Max(Plugin.Configuration.MarketBoardKeepOpenMS, 1000);
 
-    private void CompletePriceRequest(int price, int requestId)
+    private void CompletePriceRequest(int price, int requestId, bool marketBoardResponseReceived = true)
     {
       ClearPendingNoMatch();
       ClearPendingNoOfferings();
       if (requestId >= 0)
         _lastRequestId = requestId;
       _newRequest = false;
+      _marketBoardResponseReceived = marketBoardResponseReceived;
       NewPrice = price;
     }
 
