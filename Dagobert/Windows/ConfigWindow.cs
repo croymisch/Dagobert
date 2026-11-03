@@ -273,7 +273,24 @@ public sealed class ConfigWindow : Window
     if (ImGui.IsItemHovered())
     {
       ImGui.BeginTooltip();
-      ImGui.SetTooltip("Items priced below this amount are left in inventory and skipped for the rest of the Auto Pinch run. Eligible inventory items are listed only when their price meets this minimum.");
+      ImGui.SetTooltip("Items priced below this amount are left in inventory and recorded for a cooldown. Eligible inventory items are listed only when their price meets this minimum.");
+      ImGui.EndTooltip();
+    }
+
+    int skippedInventoryItemCooldownMinutes = Plugin.Configuration.SkippedInventoryItemCheckCooldownMinutes;
+    ImGui.BeginGroup();
+    ImGui.Text("Minutes before retrying below-minimum inventory items:");
+    ImGui.SameLine();
+    if (ImGui.InputInt("##skippedInventoryItemCooldownMinutes", ref skippedInventoryItemCooldownMinutes))
+    {
+      Plugin.Configuration.SkippedInventoryItemCheckCooldownMinutes = Math.Max(skippedInventoryItemCooldownMinutes, 1);
+      Plugin.Configuration.Save();
+    }
+    ImGui.EndGroup();
+    if (ImGui.IsItemHovered())
+    {
+      ImGui.BeginTooltip();
+      ImGui.SetTooltip("Items whose proposed sale price was below the minimum will not be attempted again until this many minutes have passed. Saved per character and shared across that character's retainers.");
       ImGui.EndTooltip();
     }
 

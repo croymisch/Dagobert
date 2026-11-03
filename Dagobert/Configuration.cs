@@ -85,6 +85,8 @@ public sealed class Configuration : IPluginConfiguration
 
   public int MinimumAutoSellPrice { get; set; } = 1;
 
+  public int SkippedInventoryItemCheckCooldownMinutes { get; set; } = 240;
+
   public bool TTSWhenAllDone { get; set; } = false;
 
   public string TTSWhenAllDoneMsg { get; set; } = "Finished auto pinching all retainers";

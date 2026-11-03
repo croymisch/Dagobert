@@ -64,15 +64,18 @@ Recommended timing values are around `3000-4000 ms` for the price check delay an
 | Retainer Selection | All enabled | Choose which retainers are included when using Auto Pinch from the retainer list. Open the retainer list in-game to populate or refresh this list. |
 | Auto Pinch after all retainers are processed | On | Automatically starts Auto Pinch when AutoRetainer finishes processing all retainers. |
 | Automatically sell eligible items during Auto Pinch | Off | When enabled, Dagobert scans regular character inventory (not the Armoury Chest) after repricing each retainer and uses `Put Up for Sale` for non-stackable, tradeable equippable items and housing items in the Roof, Exterior Wall, Window, Door, Roof Decoration, Exterior Wall Decoration, Placard, Fence, Interior Wall, Flooring, Ceiling Light, Outdoor Furnishing, Furnishing, Table, Tabletop, Wall-mounted, or Rug categories. If an HQ item has no HQ Market Board listing but does have NQ listings, it uses 110% of the lowest NQ price. If there are no Market Board listings, it falls back to the highest applicable Universalis price. Otherwise normal Market Board pricing applies. It will not exceed the 20-listing limit for a retainer. |
-| Minimum item price to sell | 1 gil | A non-stackable listing with a current or proposed price below this amount is removed from that retainer and returned to inventory, regardless of the automatic-selling toggle. A below-minimum item is not automatically re-listed from inventory during the same run, but copies already listed by other retainers are still checked. Inventory items are listed only when the proposed price is equal to or above this minimum. |
+| Minimum item price to sell | 1 gil | A non-stackable listing with a current or proposed price below this amount is removed from that retainer and returned to inventory, regardless of the automatic-selling toggle. Eligible inventory items are listed only when the proposed price is equal to or above this minimum. Below-minimum inventory sale attempts are saved by item ID and deferred for the configured cooldown. |
+| Minutes before retrying below-minimum inventory items | 240 minutes | How long Dagobert waits before trying to list an inventory item again after its proposed price was below the minimum. |
 | Show errors in chat | On | Prints pinching errors and skipped items to chat. |
 | Show Price Adjustments | On | Prints detailed price changes to chat. |
 | Show Retainer Names | On | Prints each retainer name while pinching all retainers. |
 | Clear retainer Cache | - | Clears the stored list of your own retainers used for self-undercut detection. |
 
-Dagobert keeps a `RetainerMarketData.json` file in its plugin configuration directory. It records each character, retainer, and item processed for listing, including the item's name, item ID, price, and quality. Before Auto Pinch, it requests Universalis prices for the saved retainer catalog, then makes a second request for eligible inventory items. Eligible items are non-stackable and tradeable, and are either equippable or in one of the supported housing categories; only regular inventory containers are scanned, never the Armoury Chest. Both requests use the current world (not the whole data center), and Auto Pinch waits for them before processing retainers. Items without a usable Universalis result fall back to the in-game market board. Large requests are sent in API-sized batches.
+Dagobert keeps a `RetainerMarketData.json` file in its plugin configuration directory. It records each character, retainer, and item processed for listing, including the item's name, item ID, price, and quality. It also keeps a `SkippedInventorySaleItems.json` file containing one entry per item ID whose proposed sale price was below the configured minimum. Each entry records the item's name, ID, quality, the lowest observed Market Board listing price (or `null` when no listing was available), and the UTC time it was last skipped. These item IDs are excluded from sale attempts until the configured cooldown has elapsed. A successful inventory sale removes the corresponding skip record.
 
-The file is organized by character and retainer:
+Before Auto Pinch, it requests Universalis prices for the saved retainer catalog, then makes a second request for eligible inventory items. Eligible items are non-stackable and tradeable, and are either equippable or in one of the supported housing categories; only regular inventory containers are scanned, never the Armoury Chest. Items within the below-minimum cooldown are excluded from inventory sale candidates. Both requests use the current world (not the whole data center), and Auto Pinch waits for them before processing retainers. Items without a usable Universalis result fall back to the in-game market board. Large requests are sent in API-sized batches.
+
+`RetainerMarketData.json` is organized by character and retainer:
 
 ```json
 {
@@ -95,6 +98,22 @@ The file is organized by character and retainer:
           ]
         }
       ]
+    }
+  ]
+}
+```
+
+`SkippedInventorySaleItems.json` stores a flat item list keyed uniquely by item ID. Existing character/retainer-grouped skip files are flattened and deduplicated by item ID when loaded:
+
+```json
+{
+  "Items": [
+    {
+      "Name": "Item",
+      "ItemId": 456,
+      "IsHq": false,
+      "MarketBoardLowestPrice": 1000,
+      "LastCheckedUtc": "2026-11-03T14:00:00+00:00"
     }
   ]
 }

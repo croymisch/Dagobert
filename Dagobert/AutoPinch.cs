@@ -37,9 +37,11 @@ namespace Dagobert
     private readonly MarketBoardHandler _mbHandler;
     private readonly UniversalisPriceProvider _universalisPriceProvider;
     private readonly RetainerMarketDataCatalog _retainerMarketDataCatalog;
+    private readonly SkippedInventorySaleCatalog _skippedInventorySaleCatalog;
     private int? _oldPrice;
     private int? _newPrice;
     private long? _marketBoardLowestNqListingPrice;
+    private long? _marketBoardLowestPrice;
     private bool _newPriceFromUniversalis;
     private bool _skipCurrentItem = false;
     private bool _autoSellingEnabledForRun;
@@ -65,7 +67,6 @@ namespace Dagobert
     private string _currentRetainerName = string.Empty;
     private long _currentPriceRequestStartedAt;
     private readonly HashSet<uint> _autoSellSkippedItemIds = [];
-    private readonly HashSet<uint> _inventorySaleUnderMinimumItemIds = [];
     private List<RetainerMarketItem> _eligibleInventoryItems = [];
     private int _nextInventorySaleItemIndex;
     private bool _processingInventorySaleItem;
@@ -100,6 +101,7 @@ namespace Dagobert
       _mbHandler.NewPriceReceived += MBHandler_NewPriceReceived;
       _universalisPriceProvider = new UniversalisPriceProvider();
       _retainerMarketDataCatalog = new RetainerMarketDataCatalog();
+      _skippedInventorySaleCatalog = new SkippedInventorySaleCatalog();
       _cachedPricesUseUniversalisDataCenterPrices = Plugin.Configuration.UseUniversalisDataCenterPrices;
 
       // window
@@ -631,9 +633,10 @@ namespace Dagobert
       while (_nextInventorySaleItemIndex < _eligibleInventoryItems.Count)
       {
         var item = _eligibleInventoryItems[_nextInventorySaleItemIndex++];
-        if (_inventorySaleUnderMinimumItemIds.Contains(item.ItemId))
+        if (IsSkippedInventoryItemCoolingDown(item))
         {
-          Svc.Log.Debug($"{item.Name}: skipping inventory listing because an earlier sale attempt in this Auto Pinch run was below the minimum");
+          Svc.Log.Debug(
+            $"{item.Name}: skipping inventory listing because it was checked below the minimum within the last {Plugin.Configuration.SkippedInventoryItemCheckCooldownMinutes} minutes");
           continue;
         }
 
@@ -665,7 +668,7 @@ namespace Dagobert
         return true;
       }
 
-      if (_inventorySaleUnderMinimumItemIds.Contains(item.ItemId)
+      if (IsSkippedInventoryItemCoolingDown(item)
           || !TryFindInventoryItem(item.ItemId, item.IsHq, out var inventoryType, out var slotIndex))
       {
         Svc.Log.Debug($"{item.Name}: eligible inventory item is no longer available to list");
@@ -902,6 +905,7 @@ namespace Dagobert
         var rawItemName = GetRetainerSellRawItemName(addon);
         _newPrice = null;
         _marketBoardLowestNqListingPrice = null;
+        _marketBoardLowestPrice = null;
         _newPriceFromUniversalis = false;
         _universalisPriceResult = null;
         _currentPriceUsingUniversalis = false;
@@ -1019,6 +1023,9 @@ namespace Dagobert
               && !_currentAutoSellItemCanStack
               && _oldPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
+            if (ItemNameResolver.TryGetItemId(itemName, rawItemName, out var underMinimumItemId))
+              RecordSkippedInventorySaleItem(underMinimumItemId, isHq, itemName);
+
             QueueUnderMinimumItemRetrieval(retainerSell, itemName, _oldPrice.Value);
             completed = true;
             return true;
@@ -1101,13 +1108,16 @@ namespace Dagobert
           }
 
           if (_processingInventorySaleItem
+              && _currentAutoSellItemId.HasValue
+              && _newPrice.Value >= Plugin.Configuration.MinimumAutoSellPrice)
+            RemoveSkippedInventorySaleItem(_currentAutoSellItemId.Value, itemName);
+
+          if (_processingInventorySaleItem
               && _newPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
             if (_currentAutoSellItemId.HasValue)
             {
-              _inventorySaleUnderMinimumItemIds.Add(_currentAutoSellItemId.Value);
-              Svc.Log.Information(
-                $"{itemName}: recording item ID {_currentAutoSellItemId.Value} to skip further inventory sale attempts for this Auto Pinch run");
+              RecordSkippedInventorySaleItem(_currentAutoSellItemId.Value, isHq, itemName);
             }
             Svc.Log.Information(
               $"{itemName}: proposed inventory listing price {_newPrice.Value} is below the minimum {Plugin.Configuration.MinimumAutoSellPrice}; leaving the item in inventory");
@@ -1396,8 +1406,47 @@ namespace Dagobert
       Svc.Log.Debug($"New price received: {e.NewPrice}");
       _newPrice = e.NewPrice;
       _marketBoardLowestNqListingPrice = e.LowestNqListingPrice;
+      _marketBoardLowestPrice = e.MarketBoardLowestPrice;
       _newPriceFromUniversalis = false;
       _marketBoardResponseReceived = e.MarketBoardResponseReceived;
+    }
+
+    private bool IsSkippedInventoryItemCoolingDown(RetainerMarketItem item)
+    {
+      return _skippedInventorySaleCatalog.IsCoolingDown(
+        item.ItemId,
+        DateTimeOffset.UtcNow,
+        Plugin.Configuration.SkippedInventoryItemCheckCooldownMinutes);
+    }
+
+    private void RecordSkippedInventorySaleItem(uint itemId, bool isHq, string itemName)
+    {
+      try
+      {
+        _skippedInventorySaleCatalog.RecordSkippedItem(
+          itemId,
+          ItemNameResolver.GetItemName(itemId),
+          isHq,
+          _marketBoardLowestPrice);
+        Svc.Log.Information(
+          $"{itemName}: saved below-minimum sale check; next attempt is allowed after {Plugin.Configuration.SkippedInventoryItemCheckCooldownMinutes} minutes");
+      }
+      catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+      {
+        Svc.Log.Error(ex, $"{itemName}: failed to persist below-minimum inventory sale check");
+      }
+    }
+
+    private void RemoveSkippedInventorySaleItem(uint itemId, string itemName)
+    {
+      try
+      {
+        _skippedInventorySaleCatalog.RemoveItem(itemId);
+      }
+      catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+      {
+        Svc.Log.Error(ex, $"{itemName}: failed to remove its expired below-minimum skip record");
+      }
     }
 
     private unsafe bool TryRetryMarketBoardPriceCheck(string itemName)
@@ -1635,12 +1684,20 @@ namespace Dagobert
           if (itemId == 0 || !ItemNameResolver.IsEligibleForAutomaticSale(itemId))
             continue;
 
-          items.Add(new RetainerMarketItem
+          var item = new RetainerMarketItem
           {
             ItemId = itemId,
             Name = ItemNameResolver.GetItemName(itemId),
             IsHq = slot->IsHighQuality(),
-          });
+          };
+          if (IsSkippedInventoryItemCoolingDown(item))
+          {
+            Svc.Log.Debug(
+              $"{item.Name}: excluded from inventory sale candidates because its below-minimum check is still within the cooldown");
+            continue;
+          }
+
+          items.Add(item);
         }
       }
 
@@ -1846,6 +1903,8 @@ namespace Dagobert
           ItemNameResolver.GetItemName(itemId),
           price,
           itemName.Contains('\uE03C') || rawItemName.Contains('\uE03C'));
+        if (_processingInventorySaleItem)
+          _skippedInventorySaleCatalog.RemoveItem(itemId);
       }
       catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
       {
@@ -2027,6 +2086,7 @@ namespace Dagobert
       _oldPrice = null;
       _newPrice = null;
       _marketBoardLowestNqListingPrice = null;
+      _marketBoardLowestPrice = null;
       _newPriceFromUniversalis = false;
       _skipCurrentItem = false;
       _currentAutoSellItemId = null;
@@ -2144,7 +2204,6 @@ namespace Dagobert
       _currentAutoSellItemId = null;
       _currentAutoSellItemCanStack = false;
       _autoSellSkippedItemIds.Clear();
-      _inventorySaleUnderMinimumItemIds.Clear();
       _eligibleInventoryItems.Clear();
       _nextInventorySaleItemIndex = 0;
       _processingInventorySaleItem = false;
