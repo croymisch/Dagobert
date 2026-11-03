@@ -1023,9 +1023,6 @@ namespace Dagobert
               && !_currentAutoSellItemCanStack
               && _oldPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
-            if (ItemNameResolver.TryGetItemId(itemName, rawItemName, out var underMinimumItemId))
-              RecordSkippedInventorySaleItem(underMinimumItemId, isHq, itemName);
-
             QueueUnderMinimumItemRetrieval(retainerSell, itemName, _oldPrice.Value);
             completed = true;
             return true;
@@ -1223,6 +1220,11 @@ namespace Dagobert
       string itemName,
       int price)
     {
+      var rawItemName = GetRetainerSellRawItemName(retainerSell);
+      var isHq = itemName.Contains('\uE03C') || rawItemName.Contains('\uE03C');
+      if (ItemNameResolver.TryGetItemId(itemName, rawItemName, out var itemId))
+        RecordSkippedInventorySaleItem(itemId, isHq, itemName);
+
       var freeInventorySlots = GetFreeInventorySlotCount();
       if (freeInventorySlots <= 1)
       {
@@ -1234,7 +1236,6 @@ namespace Dagobert
 
       Svc.Log.Information(
         $"{itemName}: price {price} is below the minimum listing price {Plugin.Configuration.MinimumAutoSellPrice}; removing this retainer's listing and returning it to inventory");
-      var isHq = itemName.Contains('\uE03C') || GetRetainerSellRawItemName(retainerSell).Contains('\uE03C');
       CancelCurrentRetainerSale(retainerSell);
       QueueRetainerListingRetrieval(itemName, _currentAutoSellItemId, isHq);
     }
