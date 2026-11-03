@@ -10,6 +10,7 @@ using ECommons.UIHelpers.AddonMasterImplementations;
 using ECommons.UIHelpers.AtkReaderImplementations;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Common.Math;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Dalamud.Bindings.ImGui;
@@ -21,6 +22,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.IO;
 using static ECommons.UIHelpers.AtkReaderImplementations.ReaderContextMenu;
+using LuminaAddon = Lumina.Excel.Sheets.Addon;
 
 namespace Dagobert
 {
@@ -29,12 +31,15 @@ namespace Dagobert
     private const int PriceRequestTimeoutMS = 8000;
     private const int BulkPriceRequestTimeoutMS = 60000;
     private const int ContextMenuTimeoutMS = 5000;
+    private const int MaximumRetainerListings = 20;
+    private const int MaximumMarketBoardPriceCheckAttempts = 3;
 
     private readonly MarketBoardHandler _mbHandler;
     private readonly UniversalisPriceProvider _universalisPriceProvider;
     private readonly RetainerMarketDataCatalog _retainerMarketDataCatalog;
     private int? _oldPrice;
     private int? _newPrice;
+    private long? _marketBoardLowestNqListingPrice;
     private bool _newPriceFromUniversalis;
     private bool _skipCurrentItem = false;
     private bool _autoSellingEnabledForRun;
@@ -43,6 +48,7 @@ namespace Dagobert
     private uint? _currentAutoSellItemId;
     private bool _currentAutoSellItemCanStack;
     private bool _currentPriceUsingUniversalis;
+    private int _marketBoardPriceCheckAttempts;
     private UniversalisPriceResult? _universalisPriceResult;
     private Dictionary<UniversalisItemKey, List<UniversalisPriceResult>> _bulkUniversalisPrices = [];
     private CancellationTokenSource? _bulkUniversalisRequestCts;
@@ -56,8 +62,13 @@ namespace Dagobert
     private ulong? _currentRetainerId;
     private string _currentRetainerName = string.Empty;
     private long _currentPriceRequestStartedAt;
-    private HashSet<uint> _autoSellProtectedItemIds = [];
     private readonly HashSet<uint> _autoSellSkippedItemIds = [];
+    private readonly HashSet<uint> _inventorySaleUnderMinimumItemIds = [];
+    private List<RetainerMarketItem> _eligibleInventoryItems = [];
+    private int _nextInventorySaleItemIndex;
+    private bool _processingInventorySaleItem;
+    private bool _inventorySaleExpectedCountIncremented;
+    private bool _inventoryUniversalisFallbackAttempted;
     private Dictionary<(uint ItemId, bool IsHq), RetainerMarketItem> _currentRetainerObservedItems = [];
     private bool _currentRetainerCatalogSyncComplete;
     private int _currentRetainerListingIndex = -1;
@@ -365,7 +376,9 @@ namespace Dagobert
 
         if (selectedRetainerIndices.Count > 0)
         {
-          BeginBulkUniversalisPriceRefresh();
+          BeginRetainerAndInventoryUniversalisPriceRefresh(
+            _retainerMarketDataCatalog.GetItems(_currentCharacterKey),
+            "selected retainers");
           Svc.AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Talk", SkipRetainerDialog);
           Svc.AddonLifecycle.RegisterListener(AddonEvent.PostUpdate, "Talk", SkipRetainerDialog);
           foreach (var index in selectedRetainerIndices)
@@ -415,6 +428,7 @@ namespace Dagobert
       _taskManager.Enqueue(ClickSellItems, $"ClickSellItems{index}");
       _taskManager.DelayNext(500);
       _taskManager.Enqueue(() => EnqueueAllRetainerItems(InsertSingleItem, true), $"EnqueueAllRetainerItems{index}");
+      _taskManager.Enqueue(EnqueueNextInventorySale, $"SellEligibleInventoryItems{index}");
       _taskManager.Enqueue(SyncCurrentRetainerMarketData, $"SyncRetainerMarketData{index}");
       _taskManager.DelayNext(500);
       _taskManager.Enqueue(CloseRetainerSellList, $"CloseRetainerSellList{index}");
@@ -444,6 +458,9 @@ namespace Dagobert
         }
 
         BeginRetainerMarketDataSync();
+        _nextInventorySaleItemIndex = 0;
+        _processingInventorySaleItem = false;
+        _inventorySaleExpectedCountIncremented = false;
         Communicator.PrintRetainerName(retainerName);
         ECommons.Automation.Callback.Fire(addon, true, 2, index);
         return true;
@@ -520,21 +537,24 @@ namespace Dagobert
 
       BeginRetainerMarketDataSync();
       _bulkPriceWorkflow = true;
+      IReadOnlyCollection<RetainerMarketItem> retainerItemsForPriceCheck = [];
       if (_currentRetainerId.HasValue && !string.IsNullOrWhiteSpace(_currentCharacterKey))
       {
-        var retainerItems = _retainerMarketDataCatalog.GetItems(_currentCharacterKey, _currentRetainerId.Value);
+        retainerItemsForPriceCheck = _retainerMarketDataCatalog.GetItems(_currentCharacterKey, _currentRetainerId.Value);
         Svc.Log.Information($"Starting standalone Auto Pinch for active retainer '{_currentRetainerName}'; only this retainer's catalog will be refreshed");
-        BeginBulkUniversalisPriceRefresh(
-          retainerItems,
-          $"active retainer '{_currentRetainerName}'");
       }
       else
       {
         Svc.Log.Warning("Cannot refresh Universalis prices for the active retainer because its character or retainer ID is unavailable; using in-game market-board prices");
       }
+      BeginRetainerAndInventoryUniversalisPriceRefresh(
+        retainerItemsForPriceCheck,
+        $"active retainer '{_currentRetainerName}'");
 
       EnqueueAllRetainerItems(EnqueueSingleItem, false);
       _taskManager.Enqueue(SyncCurrentRetainerMarketData, "SyncRetainerMarketData");
+      _taskManager.Enqueue(EnqueueNextInventorySale, "SellEligibleInventoryItems");
+      _taskManager.Enqueue(SyncCurrentRetainerMarketData, "SyncRetainerMarketDataAfterInventorySales");
       _taskManager.Enqueue(FinishPinching, "FinishPinching");
     }
 
@@ -575,19 +595,184 @@ namespace Dagobert
       _taskManager.DelayNext(100);
       _taskManager.Enqueue(DelayMarketBoard, $"DelayMB{index}");
       _taskManager.Enqueue(ClickComparePrice, $"ClickComparePrice{index}");
-      _taskManager.Enqueue(SetNewPrice, PriceRequestTimeoutMS + 1000, false, $"SetNewPrice{index}");
+      _taskManager.Enqueue(SetNewPrice, BulkPriceRequestTimeoutMS + 1000, false, $"SetNewPrice{index}");
     }
 
     private void InsertSingleItem(int index)
     {
       // reverse order because we INSERT
-      _taskManager.Insert(SetNewPrice, PriceRequestTimeoutMS + 1000, false, $"SetNewPrice{index}");
+      _taskManager.Insert(SetNewPrice, BulkPriceRequestTimeoutMS + 1000, false, $"SetNewPrice{index}");
       _taskManager.Insert(ClickComparePrice, $"ClickComparePrice{index}");
       _taskManager.Insert(DelayMarketBoard, $"DelayMB{index}");
       _taskManager.InsertDelayNext(100);
       _taskManager.Insert(ClickAdjustPrice, ContextMenuTimeoutMS + 2000, false, $"ClickAdjustPrice{index}");
       _taskManager.InsertDelayNext(100);
       _taskManager.Insert(() => OpenItemContextMenu(index), $"OpenItemContextMenu{index}");
+    }
+
+    private bool? EnqueueNextInventorySale()
+    {
+      _processingInventorySaleItem = false;
+      _inventorySaleExpectedCountIncremented = false;
+      if (!_autoSellingEnabledForRun || _eligibleInventoryItems.Count == 0)
+        return true;
+
+      if (!TryGetRetainerListingCount(out var listingCount))
+        return false;
+
+      if (Math.Max(listingCount, _currentRetainerExpectedItemCount) >= MaximumRetainerListings)
+      {
+        Svc.Log.Information($"Retainer '{_currentRetainerName}' has reached the {MaximumRetainerListings}-item market listing limit; no inventory items will be listed");
+        return true;
+      }
+
+      while (_nextInventorySaleItemIndex < _eligibleInventoryItems.Count)
+      {
+        var item = _eligibleInventoryItems[_nextInventorySaleItemIndex++];
+        if (_inventorySaleUnderMinimumItemIds.Contains(item.ItemId))
+        {
+          Svc.Log.Debug($"{item.Name}: skipping inventory listing because an earlier sale attempt in this Auto Pinch run was below the minimum");
+          continue;
+        }
+
+        if (!TryFindInventoryItem(item.ItemId, item.IsHq, out _, out _))
+          continue;
+
+        _taskManager.Insert(EnqueueNextInventorySale, "SellNextEligibleInventoryItem");
+        _taskManager.InsertDelayNext(350);
+        _taskManager.Insert(SetNewPrice, BulkPriceRequestTimeoutMS + 1000, false, $"SetInventorySalePrice{item.ItemId}");
+        _taskManager.Insert(ClickComparePrice, $"PriceInventorySaleItem{item.ItemId}");
+        _taskManager.InsertDelayNext(150);
+        _taskManager.Insert(ClickPutUpForSale, ContextMenuTimeoutMS + 1000, false, $"SelectPutUpForSale{item.ItemId}");
+        _taskManager.InsertDelayNext(100);
+        _taskManager.Insert(() => OpenInventoryItemForSale(item), $"OpenInventoryItemForSale{item.ItemId}");
+        return true;
+      }
+
+      Svc.Log.Information($"No more eligible inventory items are available to list for retainer '{_currentRetainerName}'");
+      return true;
+    }
+
+    private unsafe bool? OpenInventoryItemForSale(RetainerMarketItem item)
+    {
+      if (!TryGetRetainerListingCount(out var listingCount))
+        return false;
+      if (Math.Max(listingCount, _currentRetainerExpectedItemCount) >= MaximumRetainerListings)
+      {
+        Svc.Log.Information($"Retainer '{_currentRetainerName}' reached the {MaximumRetainerListings}-item listing limit before listing {item.Name}");
+        return true;
+      }
+
+      if (_inventorySaleUnderMinimumItemIds.Contains(item.ItemId)
+          || !TryFindInventoryItem(item.ItemId, item.IsHq, out var inventoryType, out var slotIndex))
+      {
+        Svc.Log.Debug($"{item.Name}: eligible inventory item is no longer available to list");
+        return true;
+      }
+
+      var inventoryContext = AgentInventoryContext.Instance();
+      if (inventoryContext == null)
+      {
+        Svc.Log.Warning($"Could not open inventory context for eligible item {item.Name}");
+        return true;
+      }
+
+      if (!GenericHelpers.TryGetAddonByName<AtkUnitBase>("RetainerSellList", out var sellList)
+          || !GenericHelpers.IsAddonReady(sellList))
+        return false;
+
+      _currentRetainerListingIndex = listingCount;
+      _currentRetainerQueuedItemIndex = -1;
+      _processingInventorySaleItem = true;
+      _inventorySaleExpectedCountIncremented = false;
+      _itemContextMenuRequestedAt = Environment.TickCount64;
+      inventoryContext->OpenForItemSlot(inventoryType, slotIndex, 0, sellList->Id);
+      Svc.Log.Information($"Opening inventory context for eligible item {item.Name} to put it up for sale on retainer '{_currentRetainerName}'");
+      return true;
+    }
+
+    private unsafe bool? ClickPutUpForSale()
+    {
+      if (!GenericHelpers.TryGetAddonByName<AtkUnitBase>("ContextMenu", out var addon)
+          || !GenericHelpers.IsAddonReady(addon))
+      {
+        if (_itemContextMenuRequestedAt != 0
+            && Environment.TickCount64 - _itemContextMenuRequestedAt >= ContextMenuTimeoutMS)
+        {
+          Svc.Log.Warning($"Inventory context menu for an eligible item did not open within {ContextMenuTimeoutMS} ms");
+          _itemContextMenuRequestedAt = 0;
+          _processingInventorySaleItem = false;
+          return true;
+        }
+
+        return false;
+      }
+
+      _itemContextMenuRequestedAt = 0;
+      var contextMenu = new AddonMaster.ContextMenu(addon);
+      var entries = contextMenu.Entries;
+      var putUpForSaleText = Svc.Data.GetExcelSheet<LuminaAddon>().GetRow(99).Text.ToString().Trim();
+      var entryIndex = Array.FindIndex(entries, menuEntry =>
+        string.Equals(menuEntry.Text.Trim(), putUpForSaleText, StringComparison.OrdinalIgnoreCase));
+      if (entryIndex < 0)
+      {
+        Svc.Log.Warning(
+          $"Could not find '{putUpForSaleText}' in the inventory context menu; available actions: {string.Join(" | ", entries.Select(menuEntry => menuEntry.Text))}");
+        addon->Close(true);
+        _processingInventorySaleItem = false;
+        return true;
+      }
+
+      if (!entries[entryIndex].Select())
+      {
+        Svc.Log.Warning($"Could not select '{putUpForSaleText}' for the eligible inventory item");
+        _processingInventorySaleItem = false;
+        return true;
+      }
+
+      Svc.Log.Information($"Selected '{putUpForSaleText}' for an eligible inventory item");
+      return true;
+    }
+
+    private static unsafe bool TryFindInventoryItem(
+      uint itemId,
+      bool isHq,
+      out InventoryType inventoryType,
+      out int slotIndex)
+    {
+      var inventoryManager = InventoryManager.Instance();
+      if (inventoryManager != null)
+      {
+        InventoryType[] inventoryTypes =
+        [
+          InventoryType.Inventory1,
+          InventoryType.Inventory2,
+          InventoryType.Inventory3,
+          InventoryType.Inventory4,
+        ];
+
+        foreach (var type in inventoryTypes)
+        {
+          var container = inventoryManager->GetInventoryContainer(type);
+          if (container == null)
+            continue;
+
+          for (var index = 0; index < container->GetSize(); index++)
+          {
+            var slot = container->GetInventorySlot(index);
+            if (slot->GetBaseItemId() == itemId && slot->IsHighQuality() == isHq)
+            {
+              inventoryType = type;
+              slotIndex = index;
+              return true;
+            }
+          }
+        }
+      }
+
+      inventoryType = InventoryType.Invalid;
+      slotIndex = -1;
+      return false;
     }
 
     private unsafe bool? OpenItemContextMenu(int itemIndex)
@@ -675,7 +860,9 @@ namespace Dagobert
       {
         var itemName = GetRetainerSellItemName(addon);
         var rawItemName = GetRetainerSellRawItemName(addon);
-        if (_bulkPriceWorkflow && TryGetBulkUniversalisPrice(itemName, rawItemName, addon->AskingPrice->Value, out _))
+        if (!_processingInventorySaleItem
+            && _bulkPriceWorkflow
+            && TryGetBulkUniversalisPrice(itemName, rawItemName, addon->AskingPrice->Value, out _))
           return true;
 
         if (!_bulkPriceWorkflow
@@ -683,7 +870,9 @@ namespace Dagobert
             && _universalisPriceProvider.CanResolveItem(itemName, rawItemName))
           return true;
 
-        if (!_cachedPrices.TryGetValue(itemName, out var cachedPrice) || cachedPrice.Value <= 0)
+        if (_processingInventorySaleItem
+            || !_cachedPrices.TryGetValue(itemName, out var cachedPrice)
+            || cachedPrice.Value <= 0)
         {
           Svc.Log.Debug($"{itemName} has no cached price (or that price was <= 0), delaying next mb open");
           _taskManager.InsertDelayNext(Plugin.Configuration.GetMBPricesDelayMS);
@@ -702,18 +891,22 @@ namespace Dagobert
 
       if (GenericHelpers.TryGetAddonByName<AddonRetainerSell>("RetainerSell", out var addon) && GenericHelpers.IsAddonReady(&addon->AtkUnitBase))
       {
-        ObserveCurrentRetainerListing(addon, addon->AskingPrice->Value);
+        if (!_processingInventorySaleItem)
+          ObserveCurrentRetainerListing(addon, addon->AskingPrice->Value);
         if (!PrepareAutoSaleItem(addon))
           return true;
 
         var itemName = GetRetainerSellItemName(addon);
         var rawItemName = GetRetainerSellRawItemName(addon);
         _newPrice = null;
+        _marketBoardLowestNqListingPrice = null;
         _newPriceFromUniversalis = false;
         _universalisPriceResult = null;
         _currentPriceUsingUniversalis = false;
         _currentPriceRequestStartedAt = Environment.TickCount64;
-        if (_bulkPriceWorkflow && TryGetBulkUniversalisPrice(itemName, rawItemName, addon->AskingPrice->Value, out var bulkPrice))
+        if (!_processingInventorySaleItem
+            && _bulkPriceWorkflow
+            && TryGetBulkUniversalisPrice(itemName, rawItemName, addon->AskingPrice->Value, out var bulkPrice))
         {
           Svc.Log.Debug($"{itemName}: using prefetched Universalis price (lowest={bulkPrice.LowestListingPrice}, suggested={bulkPrice.SuggestedPrice})");
           _newPrice = bulkPrice.SuggestedPrice;
@@ -724,7 +917,8 @@ namespace Dagobert
           return true;
         }
 
-        if ((_bulkPriceWorkflow || !Plugin.Configuration.UseUniversalisDataCenterPrices)
+        if (!_processingInventorySaleItem
+            && (_bulkPriceWorkflow || !Plugin.Configuration.UseUniversalisDataCenterPrices)
             && _cachedPrices.TryGetValue(itemName, out var cachedPrice)
             && cachedPrice.Value > 0)
         {
@@ -752,6 +946,7 @@ namespace Dagobert
         }
 
         Svc.Log.Debug("Clicking compare prices");
+        _marketBoardPriceCheckAttempts++;
         _taskManager.InsertDelayNext(Plugin.Configuration.MarketBoardKeepOpenMS);
         ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 4);
         return true;
@@ -773,11 +968,21 @@ namespace Dagobert
 
         if (!_newPrice.HasValue)
         {
+          var requestTimeout = _inventoryUniversalisFallbackAttempted
+            ? BulkPriceRequestTimeoutMS
+            : PriceRequestTimeoutMS;
+          if (!_currentPriceUsingUniversalis)
+            requestTimeout = Math.Max(requestTimeout, Plugin.Configuration.MarketBoardKeepOpenMS + 1000);
           if (_currentPriceRequestStartedAt == 0
-              || Environment.TickCount64 - _currentPriceRequestStartedAt < PriceRequestTimeoutMS)
+              || Environment.TickCount64 - _currentPriceRequestStartedAt < requestTimeout)
             return false;
 
-          Svc.Log.Warning("Price check timed out; leaving the current item unchanged");
+          if (GenericHelpers.TryGetAddonByName<AddonRetainerSell>("RetainerSell", out var timedOutRetainerSell)
+              && GenericHelpers.IsAddonReady(&timedOutRetainerSell->AtkUnitBase)
+              && TryRetryMarketBoardPriceCheck(GetRetainerSellItemName(timedOutRetainerSell)))
+            return true;
+
+          Svc.Log.Warning($"Price check timed out after {requestTimeout} ms; leaving the current item unchanged");
           if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("ItemSearchResult", out var pendingSearch))
             pendingSearch->Close(true);
           if (GenericHelpers.TryGetAddonByName<AddonRetainerSell>("RetainerSell", out var pendingRetainerSell)
@@ -806,7 +1011,8 @@ namespace Dagobert
             Svc.Log.Information(
               $"{itemName}: confirmed HQ item-level-1 equippable; current price {_oldPrice.Value}, suggested price {_newPrice.Value}, minimum {Plugin.Configuration.MinimumAutoSellPrice}, max undercut {Plugin.Configuration.MaxUndercutPercentage:F2}%");
 
-          if (!_currentAutoSellItemCanStack
+          if (!_processingInventorySaleItem
+              && !_currentAutoSellItemCanStack
               && _oldPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
             QueueUnderMinimumItemRetrieval(retainerSell, itemName, _oldPrice.Value);
@@ -823,6 +1029,7 @@ namespace Dagobert
           }
 
           if (_autoPinchRun
+              && !_processingInventorySaleItem
               && _currentPriceUsingUniversalis
               && _universalisPriceResult.HasValue
               && _oldPrice.Value <= _universalisPriceResult.Value.LowestListingPrice)
@@ -831,6 +1038,35 @@ namespace Dagobert
             CancelCurrentRetainerSale(retainerSell);
             completed = true;
             return true;
+          }
+
+          if (isHq
+              && _newPrice.Value <= 0
+              && _marketBoardLowestNqListingPrice is > 0)
+          {
+            _newPrice = (int)Math.Min(
+              Math.Ceiling(_marketBoardLowestNqListingPrice.Value * 1.1d),
+              int.MaxValue);
+            _newPriceFromUniversalis = false;
+            _currentPriceUsingUniversalis = false;
+            Svc.Log.Information(
+              $"{itemName}: no HQ Market Board listing was found; using 110% of the lowest NQ listing ({_marketBoardLowestNqListingPrice.Value}) = {_newPrice.Value}");
+          }
+
+          if (_newPrice.Value <= 0
+              && !_currentPriceUsingUniversalis
+              && !_newPriceFromUniversalis
+              && TryRetryMarketBoardPriceCheck(itemName))
+            return true;
+
+          if (_newPrice.Value <= 0 && (isHq || _processingInventorySaleItem))
+          {
+            if (!_inventoryUniversalisFallbackAttempted)
+            {
+              _inventoryUniversalisFallbackAttempted = true;
+              StartUniversalisNoListingFallback(itemName, rawItemName, isHq);
+              return false;
+            }
           }
 
           if (!(_newPrice > 0))
@@ -859,20 +1095,26 @@ namespace Dagobert
             _newPrice = limitedPrice;
           }
 
-          if (!_currentAutoSellItemCanStack
+          if (_processingInventorySaleItem
               && _newPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
-            QueueUnderMinimumItemRetrieval(retainerSell, itemName, _newPrice.Value);
+            if (_currentAutoSellItemId.HasValue)
+            {
+              _inventorySaleUnderMinimumItemIds.Add(_currentAutoSellItemId.Value);
+              Svc.Log.Information(
+                $"{itemName}: recording item ID {_currentAutoSellItemId.Value} to skip further inventory sale attempts for this Auto Pinch run");
+            }
+            Svc.Log.Information(
+              $"{itemName}: proposed inventory listing price {_newPrice.Value} is below the minimum {Plugin.Configuration.MinimumAutoSellPrice}; leaving the item in inventory");
+            CancelCurrentRetainerSale(retainerSell);
             completed = true;
             return true;
           }
 
-          if (_autoSellingEnabledForRun
-              && (!_currentAutoSellItemId.HasValue || !_autoSellProtectedItemIds.Contains(_currentAutoSellItemId.Value))
-              && !isLevelOneHqEquippable)
+          if (!_currentAutoSellItemCanStack
+              && _newPrice.Value < Plugin.Configuration.MinimumAutoSellPrice)
           {
-            Svc.Log.Information($"{itemName}: not in AutoRetainer's protection list; skipping automatic sale");
-            CancelCurrentRetainerSale(retainerSell);
+            QueueUnderMinimumItemRetrieval(retainerSell, itemName, _newPrice.Value);
             completed = true;
             return true;
           }
@@ -886,7 +1128,10 @@ namespace Dagobert
             Svc.Log.Information($"{itemName}: applying price {_newPrice.Value} (was {_oldPrice.Value})");
             _cachedPrices.TryAdd(itemName, new CachedPrice(_newPrice.Value, _newPriceFromUniversalis));
             retainerSell->AskingPrice->SetValue(_newPrice.Value);
-            Communicator.PrintPriceUpdate(itemName, _oldPrice.Value, _newPrice.Value, cutPercentage, _newPriceFromUniversalis);
+            if (_autoPinchRun && _newPriceFromUniversalis && _oldPrice.Value != _newPrice.Value)
+              Communicator.PrintUniversalisPriceUpdate(itemName, _oldPrice.Value, _newPrice.Value);
+            else
+              Communicator.PrintPriceUpdate(itemName, _oldPrice.Value, _newPrice.Value, cutPercentage, _newPriceFromUniversalis);
           }
           else
           {
@@ -953,14 +1198,6 @@ namespace Dagobert
           return false;
         }
 
-        if (_autoSellingEnabledForRun
-            && _currentAutoSellItemCanStack
-            && !_autoSellProtectedItemIds.Contains(itemId))
-        {
-          CancelCurrentRetainerSale(retainerSell);
-          _skipCurrentItem = true;
-          return false;
-        }
       }
 
       return true;
@@ -1144,31 +1381,37 @@ namespace Dagobert
       _autoSellingEnabledForRun = Plugin.Configuration.EnableAutoSelling;
       if (!_autoSellingEnabledForRun)
       {
-        Svc.Log.Information("Automatic selling is disabled; AutoRetainer's protection list will not be loaded");
-        return true;
+        Svc.Log.Information("Automatic selling is disabled");
       }
-
-      if (AutoRetainerIPC.TryGetProtectionList(out var protectedItemIds))
-      {
-        _autoSellProtectedItemIds = [.. protectedItemIds];
-        Svc.Log.Information($"Loaded {_autoSellProtectedItemIds.Count} item IDs from AutoRetainer's protection list before Auto Pinch");
-        if (_autoSellProtectedItemIds.Count == 0)
-          Svc.Log.Warning("AutoRetainer's protection list is empty; automatic selling has no eligible items");
-        else
-          Svc.Log.Debug($"AutoRetainer protected item IDs passed to Dagobert: {string.Join(", ", _autoSellProtectedItemIds)}");
-        return true;
-      }
-
-      if (Plugin.Configuration.ShowErrorsInChat)
-        Svc.Chat.PrintError("Automatic selling was not started because AutoRetainer's protection list could not be retrieved.");
-      return false;
+      return true;
     }
 
     private void MBHandler_NewPriceReceived(object? sender, NewPriceEventArgs e)
     {
       Svc.Log.Debug($"New price received: {e.NewPrice}");
       _newPrice = e.NewPrice;
+      _marketBoardLowestNqListingPrice = e.LowestNqListingPrice;
       _newPriceFromUniversalis = false;
+    }
+
+    private unsafe bool TryRetryMarketBoardPriceCheck(string itemName)
+    {
+      if (!_autoPinchRun
+          || _currentPriceUsingUniversalis
+          || _newPriceFromUniversalis
+          || _marketBoardPriceCheckAttempts == 0
+          || _marketBoardPriceCheckAttempts >= MaximumMarketBoardPriceCheckAttempts)
+        return false;
+
+      if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("ItemSearchResult", out var searchResult))
+        searchResult->Close(true);
+
+      var nextAttempt = _marketBoardPriceCheckAttempts + 1;
+      Svc.Log.Warning(
+        $"{itemName}: Market Board price was unavailable; retrying price check (attempt {nextAttempt} of {MaximumMarketBoardPriceCheckAttempts})");
+      _taskManager.Insert(SetNewPrice, BulkPriceRequestTimeoutMS + 1000, false, $"RetrySetNewPrice{nextAttempt}");
+      _taskManager.Insert(ClickComparePrice, $"RetryClickComparePrice{nextAttempt}");
+      return true;
     }
 
     private static unsafe string GetRetainerSellItemName(AddonRetainerSell* addon)
@@ -1219,57 +1462,107 @@ namespace Dagobert
       _currentCharacterKey = $"{_currentCharacterName}@{_currentCharacterWorld}";
     }
 
-    private void BeginBulkUniversalisPriceRefresh()
-    {
-      if (string.IsNullOrWhiteSpace(_currentCharacterKey))
-        return;
-
-      var items = _retainerMarketDataCatalog.GetItems(_currentCharacterKey);
-      BeginBulkUniversalisPriceRefresh(items, "selected retainers");
-    }
-
-    private void BeginBulkUniversalisPriceRefresh(
-      IReadOnlyCollection<RetainerMarketItem> items,
+    private void BeginRetainerAndInventoryUniversalisPriceRefresh(
+      IReadOnlyCollection<RetainerMarketItem> retainerItems,
       string refreshScope)
     {
-      if (items.Count == 0)
+      _eligibleInventoryItems = GetEligibleInventoryItems();
+      var inventoryPriceItems = _eligibleInventoryItems
+        .GroupBy(item => (item.ItemId, item.IsHq))
+        .Select(group => group.First())
+        .ToArray();
+
+      if (retainerItems.Count == 0 && inventoryPriceItems.Length == 0)
       {
-        Svc.Log.Information($"Universalis batch request skipped because there are no catalog entries for {refreshScope}; Auto Pinch will use in-game market-board prices");
+        Svc.Log.Information($"Universalis pre-pinch requests skipped because there are no retainer catalog or eligible inventory items for {refreshScope}");
         return;
       }
 
-      Svc.Log.Information($"Starting Universalis batch request for {items.Count} retainer catalog entries ({refreshScope}); Auto Pinch will wait for the response before processing");
+      var worldName = Svc.Objects.LocalPlayer?.CurrentWorld.ValueNullable?.Name.ToString();
+      if (string.IsNullOrWhiteSpace(worldName))
+      {
+        Svc.Log.Warning($"Could not resolve current world for Universalis pre-pinch requests ({refreshScope}); continuing with in-game market-board pricing");
+        return;
+      }
+
+      Svc.Log.Information(
+        $"Starting sequential Universalis pre-pinch requests: {retainerItems.Count} retainer catalog items, then {inventoryPriceItems.Length} eligible inventory items ({refreshScope})");
       _bulkUniversalisRequestCts?.Cancel();
       _bulkUniversalisRequestCts?.Dispose();
       _bulkUniversalisRequestCts = new CancellationTokenSource();
       var requestId = ++_bulkUniversalisRequestId;
       _bulkUniversalisRequestCompleted = false;
-      _bulkUniversalisRequestSucceeded = false;
+      _bulkUniversalisRequestSucceeded = true;
       _bulkUniversalisRequestStartedAt = Environment.TickCount64;
       _bulkUniversalisPrices.Clear();
       _taskManager.Enqueue(WaitForBulkUniversalisPriceRefresh, BulkPriceRequestTimeoutMS, false, "WaitForUniversalisRefresh");
-      _ = CompleteBulkUniversalisPriceRefresh(items, requestId, _bulkUniversalisRequestCts.Token);
+      _ = CompleteRetainerAndInventoryUniversalisPriceRefresh(
+        retainerItems,
+        inventoryPriceItems,
+        worldName,
+        refreshScope,
+        requestId,
+        _bulkUniversalisRequestCts.Token);
     }
 
-    private async Task CompleteBulkUniversalisPriceRefresh(
-      IReadOnlyCollection<RetainerMarketItem> items,
+    private async Task CompleteRetainerAndInventoryUniversalisPriceRefresh(
+      IReadOnlyCollection<RetainerMarketItem> retainerItems,
+      IReadOnlyCollection<RetainerMarketItem> inventoryItems,
+      string worldName,
+      string refreshScope,
       int requestId,
       CancellationToken cancellationToken)
     {
       Dictionary<UniversalisItemKey, List<UniversalisPriceResult>> prices = [];
-      var requestSucceeded = false;
-      try
+      var requestSucceeded = true;
+      if (retainerItems.Count > 0)
       {
-        prices = await _universalisPriceProvider.GetPrices(items, cancellationToken).ConfigureAwait(false);
-        requestSucceeded = true;
+        Svc.Log.Information($"Requesting Universalis prices for {retainerItems.Count} retainer catalog items before inventory items ({refreshScope})");
+        try
+        {
+          prices = await _universalisPriceProvider.GetPrices(retainerItems, worldName, cancellationToken).ConfigureAwait(false);
+          Svc.Log.Information($"Universalis request for retainer catalog items completed ({prices.Count} priced item qualities)");
+        }
+        catch (OperationCanceledException)
+        {
+          return;
+        }
+        catch (Exception ex)
+        {
+          requestSucceeded = false;
+          Svc.Log.Warning(ex, "Failed to fetch retainer catalog prices; continuing with the eligible inventory item price request");
+        }
       }
-      catch (OperationCanceledException)
+      else
       {
-        return;
+        Svc.Log.Information($"Retainer catalog Universalis request skipped because there are no catalog items for {refreshScope}");
       }
-      catch (Exception ex)
+
+      if (inventoryItems.Count > 0)
       {
-        Svc.Log.Warning(ex, "Failed to refresh the retainer catalog from Universalis; Auto Pinch will use in-game market-board prices for missing items");
+        Svc.Log.Information($"Requesting Universalis prices for {inventoryItems.Count} eligible inventory items after retainer catalog prices");
+        try
+        {
+          var inventoryPrices = await _universalisPriceProvider
+            .GetPrices(inventoryItems, worldName, cancellationToken)
+            .ConfigureAwait(false);
+          foreach (var (key, candidates) in inventoryPrices)
+            prices[key] = candidates;
+          Svc.Log.Information($"Universalis request for eligible inventory items completed ({inventoryPrices.Count} priced item qualities)");
+        }
+        catch (OperationCanceledException)
+        {
+          return;
+        }
+        catch (Exception ex)
+        {
+          requestSucceeded = false;
+          Svc.Log.Warning(ex, "Failed to fetch eligible inventory item prices; Auto Pinch will use in-game market-board prices for missing items");
+        }
+      }
+      else
+      {
+        Svc.Log.Information($"Eligible inventory Universalis request skipped because no matching items are in inventory for {refreshScope}");
       }
 
       try
@@ -1283,11 +1576,9 @@ namespace Dagobert
           _bulkUniversalisRequestCompleted = true;
           _bulkUniversalisRequestSucceeded = requestSucceeded;
           if (!requestSucceeded)
-            Svc.Log.Warning("Universalis batch request failed; Auto Pinch will use in-game market-board prices for missing items");
-          else if (prices.Count > 0)
-            Svc.Log.Information($"Universalis batch response received with usable prices for {prices.Count} item qualities");
+            Svc.Log.Warning("At least one Universalis pre-pinch request failed; missing item prices will use the in-game market-board fallback");
           else
-            Svc.Log.Information("Universalis batch response received with no usable item prices; Auto Pinch will use in-game market-board prices for missing items");
+            Svc.Log.Information($"All ordered Universalis pre-pinch requests completed with usable prices for {prices.Count} item qualities");
         }).ConfigureAwait(false);
       }
       catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1295,8 +1586,59 @@ namespace Dagobert
       }
       catch (Exception ex)
       {
-        Svc.Log.Warning(ex, "Failed to return the Universalis batch result to Auto Pinch");
+        Svc.Log.Warning(ex, "Failed to publish the ordered Universalis pre-pinch results");
       }
+    }
+
+    private unsafe List<RetainerMarketItem> GetEligibleInventoryItems()
+    {
+      var items = new List<RetainerMarketItem>();
+      if (!_autoSellingEnabledForRun)
+        return items;
+
+      var inventoryManager = InventoryManager.Instance();
+      if (inventoryManager == null)
+      {
+        Svc.Log.Warning("Could not inspect character inventory for eligible items to list");
+        return items;
+      }
+
+      // Scan only regular inventory containers; Armoury Chest items must never be sold.
+      InventoryType[] inventoryTypes =
+      [
+        InventoryType.Inventory1,
+        InventoryType.Inventory2,
+        InventoryType.Inventory3,
+        InventoryType.Inventory4,
+      ];
+
+      foreach (var inventoryType in inventoryTypes)
+      {
+        var container = inventoryManager->GetInventoryContainer(inventoryType);
+        if (container == null)
+        {
+          Svc.Log.Warning($"Could not inspect {inventoryType} for eligible items to list");
+          continue;
+        }
+
+        for (var slotIndex = 0; slotIndex < container->GetSize(); slotIndex++)
+        {
+          var slot = container->GetInventorySlot(slotIndex);
+          var itemId = slot->GetBaseItemId();
+          if (itemId == 0 || !ItemNameResolver.IsEligibleForAutomaticSale(itemId))
+            continue;
+
+          items.Add(new RetainerMarketItem
+          {
+            ItemId = itemId,
+            Name = ItemNameResolver.GetItemName(itemId),
+            IsHq = slot->IsHighQuality(),
+          });
+        }
+      }
+
+      Svc.Log.Information($"Found {items.Count} tradeable, non-stackable equippable inventory items eligible for listing and Universalis pricing");
+      return items;
     }
 
     private bool? WaitForBulkUniversalisPriceRefresh()
@@ -1304,11 +1646,11 @@ namespace Dagobert
       if (_bulkUniversalisRequestCompleted)
       {
         if (_bulkUniversalisRequestSucceeded && _bulkUniversalisPrices.Count > 0)
-          Svc.Log.Information($"Universalis batch request was awaited and completed with {_bulkUniversalisPrices.Count} priced item qualities; starting Auto Pinch");
+          Svc.Log.Information($"Ordered Universalis requests for retainer and eligible inventory items were awaited; received prices for {_bulkUniversalisPrices.Count} item qualities; starting Auto Pinch");
         else if (_bulkUniversalisRequestSucceeded)
-          Svc.Log.Information("Universalis batch request was awaited and completed without usable prices; starting Auto Pinch with in-game market-board fallback");
+          Svc.Log.Information("Ordered Universalis requests for retainer and eligible inventory items were awaited without usable prices; starting Auto Pinch with in-game market-board fallback");
         else
-          Svc.Log.Warning("Universalis batch request was awaited but failed; starting Auto Pinch with in-game market-board fallback");
+          Svc.Log.Warning("At least one ordered Universalis request failed; starting Auto Pinch with in-game market-board fallback for missing prices");
         CancelBulkUniversalisPriceRefresh();
         return true;
       }
@@ -1316,7 +1658,7 @@ namespace Dagobert
       if (Environment.TickCount64 - _bulkUniversalisRequestStartedAt < BulkPriceRequestTimeoutMS)
         return false;
 
-      Svc.Log.Warning("Universalis batch price refresh timed out; Auto Pinch will use in-game market-board prices");
+      Svc.Log.Warning("Ordered Universalis pre-pinch price requests timed out; Auto Pinch will use in-game market-board prices for missing items");
       CancelBulkUniversalisPriceRefresh();
       return true;
     }
@@ -1476,6 +1818,13 @@ namespace Dagobert
         return;
       }
 
+      if (_processingInventorySaleItem && !_inventorySaleExpectedCountIncremented)
+      {
+        _currentRetainerExpectedItemCount++;
+        _currentRetainerObservedItemCount++;
+        _inventorySaleExpectedCountIncremented = true;
+      }
+
       ObserveCurrentRetainerListing(retainerSell, price, false);
 
       try
@@ -1550,6 +1899,112 @@ namespace Dagobert
       });
     }
 
+    private void StartUniversalisNoListingFallback(string itemName, string rawItemName, bool isHq)
+    {
+      CancelUniversalisPriceRequest();
+      var player = Svc.Objects.LocalPlayer;
+      var worldName = player?.CurrentWorld.ValueNullable?.Name.ToString();
+      var dataCenterName = player?.CurrentWorld.ValueNullable?.DataCenter.ValueNullable?.Name.ToString();
+
+      var requestId = ++_universalisPriceRequestId;
+      _newPrice = null;
+      _newPriceFromUniversalis = false;
+      _currentPriceUsingUniversalis = true;
+      _universalisPriceResult = null;
+      _currentPriceRequestStartedAt = Environment.TickCount64;
+      _universalisPriceRequestCts = new CancellationTokenSource();
+      if (string.IsNullOrWhiteSpace(dataCenterName)
+          || isHq && string.IsNullOrWhiteSpace(worldName))
+      {
+        Svc.Log.Warning($"{itemName}: could not resolve the required world or data center for the Universalis no-listing fallback");
+        _newPrice = -1;
+        return;
+      }
+
+      Svc.Log.Information(isHq
+        ? $"{itemName}: Market Board returned no HQ listing; requesting up to 100 HQ listings from Universalis for the current world"
+        : $"{itemName}: Market Board returned no listing; requesting up to 100 HQ/NQ listings from Universalis");
+      _ = CompleteUniversalisNoListingFallback(
+        itemName,
+        rawItemName,
+        isHq,
+        worldName ?? string.Empty,
+        dataCenterName ?? string.Empty,
+        requestId,
+        _universalisPriceRequestCts.Token);
+    }
+
+    private async Task CompleteUniversalisNoListingFallback(
+      string itemName,
+      string rawItemName,
+      bool isHq,
+      string worldName,
+      string dataCenterName,
+      int requestId,
+      CancellationToken cancellationToken)
+    {
+      UniversalisPriceResult? priceResult = null;
+      var usedDataCenterHqFallback = false;
+      try
+      {
+        if (isHq)
+        {
+          priceResult = await _universalisPriceProvider
+            .GetHighestHqPriceOnCurrentWorld(itemName, rawItemName, worldName, cancellationToken)
+            .ConfigureAwait(false);
+          if (!priceResult.HasValue)
+          {
+            Svc.Log.Information(
+              $"{itemName}: no usable HQ Universalis listings were found on the current world; checking the data center");
+            priceResult = await _universalisPriceProvider
+              .GetHighestHqPriceOnDataCenter(itemName, rawItemName, dataCenterName, cancellationToken)
+              .ConfigureAwait(false);
+            usedDataCenterHqFallback = true;
+          }
+        }
+        else
+        {
+          priceResult = await _universalisPriceProvider
+            .GetHighestPriceAcrossQualities(itemName, rawItemName, dataCenterName, cancellationToken)
+            .ConfigureAwait(false);
+        }
+      }
+      catch (OperationCanceledException)
+      {
+        return;
+      }
+      catch (Exception ex)
+      {
+        Svc.Log.Warning(ex, $"Failed to fetch the Universalis no-listing fallback price for {itemName}");
+      }
+
+      await Svc.Framework.RunOnFrameworkThread(() =>
+      {
+        if (_disposed || requestId != _universalisPriceRequestId)
+          return;
+
+        _universalisPriceResult = priceResult;
+        if (priceResult.HasValue)
+        {
+          _newPrice = priceResult.Value.SuggestedPrice;
+          _newPriceFromUniversalis = true;
+          Svc.Log.Information(isHq
+            ? usedDataCenterHqFallback
+              ? $"{itemName}: highest HQ price on the data center is {_newPrice.Value}; using it because the current world has no HQ listings"
+              : $"{itemName}: highest HQ price on the current world is {_newPrice.Value}; using it because the Market Board has no HQ listing"
+            : $"{itemName}: highest HQ/NQ Universalis price is {_newPrice.Value}; using it because the Market Board has no current listing");
+        }
+        else
+        {
+          _newPrice = -1;
+          _newPriceFromUniversalis = false;
+          Svc.Log.Warning(isHq
+            ? $"{itemName}: no usable HQ Universalis listings were found on the current world or data center"
+            : $"{itemName}: no usable HQ/NQ Universalis listings were found after the Market Board returned no listings");
+        }
+      });
+    }
+
     private void CancelUniversalisPriceRequest()
     {
       _universalisPriceRequestId++;
@@ -1563,11 +2018,14 @@ namespace Dagobert
       CancelUniversalisPriceRequest();
       _oldPrice = null;
       _newPrice = null;
+      _marketBoardLowestNqListingPrice = null;
       _newPriceFromUniversalis = false;
       _skipCurrentItem = false;
       _currentAutoSellItemId = null;
       _currentAutoSellItemCanStack = false;
+      _inventoryUniversalisFallbackAttempted = false;
       _currentPriceUsingUniversalis = false;
+      _marketBoardPriceCheckAttempts = 0;
       _universalisPriceResult = null;
       _currentPriceRequestStartedAt = 0;
     }
@@ -1675,8 +2133,13 @@ namespace Dagobert
       _autoSellingEnabledForRun = false;
       _currentAutoSellItemId = null;
       _currentAutoSellItemCanStack = false;
-      _autoSellProtectedItemIds.Clear();
       _autoSellSkippedItemIds.Clear();
+      _inventorySaleUnderMinimumItemIds.Clear();
+      _eligibleInventoryItems.Clear();
+      _nextInventorySaleItemIndex = 0;
+      _processingInventorySaleItem = false;
+      _inventorySaleExpectedCountIncremented = false;
+      _inventoryUniversalisFallbackAttempted = false;
     }
 
     private void ClearCachedPricesIfUniversalisSettingChanged()

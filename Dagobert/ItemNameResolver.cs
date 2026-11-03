@@ -1,9 +1,11 @@
 using Dalamud.Game.Text.SeStringHandling;
 using ECommons;
 using ECommons.DalamudServices;
+using ECommons.ExcelServices.Enums;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 
@@ -12,6 +14,26 @@ namespace Dagobert;
 internal static class ItemNameResolver
 {
   private static readonly Lazy<ExcelSheet<Item>> Items = new(() => Svc.Data.GetExcelSheet<Item>());
+  private static readonly HashSet<uint> AdditionalAutoSaleCategories =
+  [
+    (uint)ItemUICategoryEnum.Roof,
+    (uint)ItemUICategoryEnum.ExteriorWall,
+    (uint)ItemUICategoryEnum.Window,
+    (uint)ItemUICategoryEnum.Door,
+    (uint)ItemUICategoryEnum.RoofDecoration,
+    (uint)ItemUICategoryEnum.ExteriorWallDecoration,
+    (uint)ItemUICategoryEnum.Placard,
+    (uint)ItemUICategoryEnum.Fence,
+    (uint)ItemUICategoryEnum.InteriorWall,
+    (uint)ItemUICategoryEnum.Flooring,
+    (uint)ItemUICategoryEnum.CeilingLight,
+    (uint)ItemUICategoryEnum.OutdoorFurnishing,
+    (uint)ItemUICategoryEnum.Furnishing,
+    (uint)ItemUICategoryEnum.Table,
+    (uint)ItemUICategoryEnum.Tabletop,
+    (uint)ItemUICategoryEnum.WallMounted,
+    (uint)ItemUICategoryEnum.Rug,
+  ];
 
   public static bool TryGetItemId(string itemName, string rawItemName, out uint itemId)
   {
@@ -35,6 +57,15 @@ internal static class ItemNameResolver
   public static bool CanStack(uint itemId)
   {
     return Items.Value.TryGetRow(itemId, out var item) && item.StackSize > 1;
+  }
+
+  public static bool IsEligibleForAutomaticSale(uint itemId)
+  {
+    return Items.Value.TryGetRow(itemId, out var item)
+           && item.StackSize == 1
+           && (item.EquipSlotCategory.RowId != 0
+               || AdditionalAutoSaleCategories.Contains(item.ItemUICategory.RowId))
+           && !item.IsUntradable;
   }
 
   public static bool IsLevelOneEquippable(uint itemId)

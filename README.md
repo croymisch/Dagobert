@@ -23,12 +23,12 @@ The `/dagobert` configuration window has two tabs:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| Use HQ price | On | Uses HQ listings for HQ items. If no HQ listing is available, Dagobert may not find a price. |
+| Use HQ price | On | Uses HQ listings for HQ items. If an HQ item has no HQ Market Board listing but does have NQ listings, Dagobert uses 110% of the lowest NQ listing price. |
 | Undercut Mode | FixedAmount | Choose between subtracting a fixed gil amount or a percentage from the lowest price. |
 | Undercut amount | 1 gil | How much to undercut by. In Percentage mode this is 1-99%. |
 | Max Undercut percentage | 100% | Safety limit. Price changes that would cut more than this percentage are skipped. |
 | Undercut Self | Off | When off, Dagobert will not undercut listings from your own retainers. |
-| Use Universalis data center prices | Off | Controls data-center Universalis pricing for manual/post-pinch checks. Full Auto Pinch refreshes its saved retainer item catalog from Universalis using the logged-in character's current world before processing retainers; listings already at or below that world's lowest price are skipped without changing their asking price. |
+| Use Universalis data center prices | Off | Controls data-center Universalis pricing for manual/post-pinch checks. Before Auto Pinch, Dagobert refreshes saved retainer listings and then eligible items in character inventory from Universalis using the current world; it waits for both requests before processing retainers. Listings already at or below that world's lowest price are skipped without changing their asking price. |
 | Default amount | 0 gil | Fallback price when no price can be found. `0` disables the fallback. |
 | Show inventory context menu entry | On | Adds the right-click inventory entry used to add or configure per-item min/max prices. |
 
@@ -63,14 +63,14 @@ Recommended timing values are around `3000-4000 ms` for the price check delay an
 | --- | --- | --- |
 | Retainer Selection | All enabled | Choose which retainers are included when using Auto Pinch from the retainer list. Open the retainer list in-game to populate or refresh this list. |
 | Auto Pinch after all retainers are processed | On | Automatically starts Auto Pinch when AutoRetainer finishes processing all retainers. |
-| Automatically sell protected items during Auto Pinch | Off | When enabled, only items on AutoRetainer's protection list are eligible for automatic sale. A full retainer market board does not block repricing its existing listings. |
-| Minimum item price to sell | 1 gil | Non-stackable retainer listings whose current or proposed price is below this integer amount are retrieved from the market and returned to inventory, regardless of the automatic-selling toggle. Those items are skipped for automatic selling for the remainder of the run. Only items on AutoRetainer's protection list can be automatically listed. |
+| Automatically sell eligible items during Auto Pinch | Off | When enabled, Dagobert scans regular character inventory (not the Armoury Chest) after repricing each retainer and uses `Put Up for Sale` for non-stackable, tradeable equippable items and housing items in the Roof, Exterior Wall, Window, Door, Roof Decoration, Exterior Wall Decoration, Placard, Fence, Interior Wall, Flooring, Ceiling Light, Outdoor Furnishing, Furnishing, Table, Tabletop, Wall-mounted, or Rug categories. If an HQ item has no HQ Market Board listing but does have NQ listings, it uses 110% of the lowest NQ price. If there are no Market Board listings, it falls back to the highest applicable Universalis price. Otherwise normal Market Board pricing applies. It will not exceed the 20-listing limit for a retainer. |
+| Minimum item price to sell | 1 gil | A non-stackable listing with a current or proposed price below this amount is removed from that retainer and returned to inventory, regardless of the automatic-selling toggle. A below-minimum item is not automatically re-listed from inventory during the same run, but copies already listed by other retainers are still checked. Inventory items are listed only when the proposed price is equal to or above this minimum. |
 | Show errors in chat | On | Prints pinching errors and skipped items to chat. |
 | Show Price Adjustments | On | Prints detailed price changes to chat. |
 | Show Retainer Names | On | Prints each retainer name while pinching all retainers. |
 | Clear retainer Cache | - | Clears the stored list of your own retainers used for self-undercut detection. |
 
-Dagobert keeps a `RetainerMarketData.json` file in its plugin configuration directory. It records each character, retainer, and item processed for listing, including the item's name, item ID, price, and quality. On a first run with no catalog items, Auto Pinch uses the in-game current-world market board and records items as it processes them. Later full Auto Pinch runs refresh catalog prices from Universalis once before processing any retainer, requesting the current world (not the whole data center); items without a usable Universalis result fall back to the in-game market board. Large catalogs are sent in API-sized batches.
+Dagobert keeps a `RetainerMarketData.json` file in its plugin configuration directory. It records each character, retainer, and item processed for listing, including the item's name, item ID, price, and quality. Before Auto Pinch, it requests Universalis prices for the saved retainer catalog, then makes a second request for eligible inventory items. Eligible items are non-stackable and tradeable, and are either equippable or in one of the supported housing categories; only regular inventory containers are scanned, never the Armoury Chest. Both requests use the current world (not the whole data center), and Auto Pinch waits for them before processing retainers. Items without a usable Universalis result fall back to the in-game market board. Large requests are sent in API-sized batches.
 
 The file is organized by character and retainer:
 

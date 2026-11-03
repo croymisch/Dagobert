@@ -20,6 +20,7 @@ namespace Dagobert
     private bool _useHq;
     private bool _itemHq;
     private bool _itemLevelOneEquippable;
+    private long? _lowestNqListingPrice;
     private int _lastRequestId = UnknownRequestId;
     private int _pendingNoMatchRequestId = UnknownRequestId;
     private long _pendingNoMatchTimeoutAt;
@@ -31,7 +32,8 @@ namespace Dagobert
       set
       {
         _newPrice = value;
-        NewPriceReceived?.Invoke(this, new NewPriceEventArgs(NewPrice));
+        NewPriceReceived?.Invoke(this, new NewPriceEventArgs(NewPrice, _lowestNqListingPrice));
+        _lowestNqListingPrice = null;
       }
     }
     private int _newPrice;
@@ -82,6 +84,17 @@ namespace Dagobert
       }
 
       var skipNq = _useHq && _items.Single(j => j.RowId == currentOfferings.ItemListings[0].ItemId).CanBeHq;
+      if (skipNq)
+      {
+        var lowestNqListing = currentOfferings.ItemListings
+          .Where(listing => !listing.IsHq && listing.PricePerUnit > 0)
+          .MinBy(listing => listing.PricePerUnit);
+        if (lowestNqListing != null)
+          _lowestNqListingPrice = !_lowestNqListingPrice.HasValue
+            ? lowestNqListing.PricePerUnit
+            : Math.Min(_lowestNqListingPrice.Value, lowestNqListing.PricePerUnit);
+      }
+
       var i = 0;
       while (i < currentOfferings.ItemListings.Count)
       {
@@ -144,6 +157,7 @@ namespace Dagobert
       _newRequest = true;
       _useHq = Plugin.Configuration.HQ && _itemHq && !_itemLevelOneEquippable;
       ClearPendingNoMatch();
+      _lowestNqListingPrice = null;
       _pendingNoOfferingsTimeoutAt = Environment.TickCount64 + GetMarketBoardResultTimeoutMs();
     }
 

@@ -31,9 +31,14 @@ internal sealed class UniversalisClient : IDisposable
     _client.DefaultRequestHeaders.UserAgent.ParseAdd($"Dagobert/{Plugin.PluginInterface.Manifest.AssemblyVersion}");
   }
 
-  public async Task<UniversalisMarketDataResponse> GetMarketData(uint itemId, string worldDcRegion, bool hqOnly, CancellationToken cancellationToken)
+  public async Task<UniversalisMarketDataResponse> GetMarketData(
+    uint itemId,
+    string worldDcRegion,
+    bool hqOnly,
+    CancellationToken cancellationToken,
+    int listingCount = ListingCount)
   {
-    var query = hqOnly ? $"?listings={ListingCount}&entries=0&hq=true" : $"?listings={ListingCount}&entries=0";
+    var query = hqOnly ? $"?listings={listingCount}&entries=0&hq=true" : $"?listings={listingCount}&entries=0";
     var requestUri = new Uri($"{Uri.EscapeDataString(worldDcRegion)}/{itemId}{query}", UriKind.Relative);
 
     using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);

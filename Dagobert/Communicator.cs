@@ -38,6 +38,26 @@ public static class Communicator
       Svc.Chat.Print($"{itemName}: Pinching from {oldPrice.Value:N0} to {newPrice.Value:N0}{sourceText}, a {dec} of {MathF.Abs(MathF.Round(cutPercentage, 2))}%");
   }
 
+  public static void PrintUniversalisPriceUpdate(string itemName, int oldPrice, int newPrice)
+  {
+    if (!Plugin.Configuration.ShowPriceAdjustmentsMessages || oldPrice == newPrice)
+      return;
+
+    var itemPayload = RawItemNameToItemPayload(itemName);
+    if (itemPayload != null)
+    {
+      var seString = new SeStringBuilder()
+        .AddItemLink(itemPayload.ItemId, itemPayload.IsHQ)
+        .AddText($": Auto Pinch set price using Universalis from {oldPrice:N0} to {newPrice:N0} gil")
+        .Build();
+      Svc.Chat.Print(seString);
+    }
+    else
+    {
+      Svc.Chat.Print($"{itemName}: Auto Pinch set price using Universalis from {oldPrice:N0} to {newPrice:N0} gil");
+    }
+  }
+
   private static ItemPayload? RawItemNameToItemPayload(string itemName)
   {
     // Parse as SeString

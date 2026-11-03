@@ -57,11 +57,119 @@ internal sealed class UniversalisPriceProvider : IDisposable
     return new UniversalisPriceResult(listing.PricePerUnit, CalculateNewPrice(listing.PricePerUnit, ownRetainer));
   }
 
-  public async Task<Dictionary<UniversalisItemKey, List<UniversalisPriceResult>>> GetPrices(
-    IReadOnlyCollection<RetainerMarketItem> items,
+  public async Task<UniversalisPriceResult?> GetHighestPriceAcrossQualities(
+    string itemName,
+    string rawItemName,
+    string dataCenterName,
     CancellationToken cancellationToken)
   {
-    var worldName = Svc.Objects.LocalPlayer?.CurrentWorld.ValueNullable?.Name.ToString();
+    if (!TryGetItem(itemName, rawItemName, out var itemId, out _))
+    {
+      Svc.Log.Warning($"Could not resolve item id for Universalis inventory sale fallback: {NormalizeItemName(itemName)}");
+      return null;
+    }
+
+    if (string.IsNullOrWhiteSpace(dataCenterName))
+    {
+      Svc.Log.Warning("Could not resolve current data center for Universalis inventory sale fallback");
+      return null;
+    }
+
+    var marketData = await _client.GetMarketData(
+      itemId,
+      dataCenterName,
+      false,
+      cancellationToken,
+      listingCount: 100).ConfigureAwait(false);
+    var listing = marketData.Listings
+      .Where(candidate => candidate.PricePerUnit > 0)
+      .MaxBy(candidate => candidate.PricePerUnit);
+    if (listing == null)
+      return null;
+
+    Svc.Log.Information(
+      $"Universalis inventory sale fallback for item {itemId}: highest HQ/NQ price is {listing.PricePerUnit} on {listing.WorldName ?? dataCenterName}");
+    var price = (int)Math.Min(listing.PricePerUnit, int.MaxValue);
+    return new UniversalisPriceResult(price, price);
+  }
+
+  public async Task<UniversalisPriceResult?> GetHighestHqPriceOnCurrentWorld(
+    string itemName,
+    string rawItemName,
+    string worldName,
+    CancellationToken cancellationToken)
+  {
+    if (!TryGetItem(itemName, rawItemName, out var itemId, out _))
+    {
+      Svc.Log.Warning($"Could not resolve item id for HQ Universalis fallback: {NormalizeItemName(itemName)}");
+      return null;
+    }
+
+    if (string.IsNullOrWhiteSpace(worldName))
+    {
+      Svc.Log.Warning("Could not resolve current world for HQ Universalis fallback");
+      return null;
+    }
+
+    var marketData = await _client.GetMarketData(
+      itemId,
+      worldName,
+      true,
+      cancellationToken,
+      listingCount: 100).ConfigureAwait(false);
+    var listing = marketData.Listings
+      .Where(candidate => candidate.Hq && candidate.PricePerUnit > 0)
+      .MaxBy(candidate => candidate.PricePerUnit);
+    if (listing == null)
+      return null;
+
+    Svc.Log.Information(
+      $"HQ Universalis fallback for item {itemId} on {worldName}: highest HQ price is {listing.PricePerUnit}");
+    var price = (int)Math.Min(listing.PricePerUnit, int.MaxValue);
+    return new UniversalisPriceResult(price, price);
+  }
+
+  public async Task<UniversalisPriceResult?> GetHighestHqPriceOnDataCenter(
+    string itemName,
+    string rawItemName,
+    string dataCenterName,
+    CancellationToken cancellationToken)
+  {
+    if (!TryGetItem(itemName, rawItemName, out var itemId, out _))
+    {
+      Svc.Log.Warning($"Could not resolve item id for HQ Universalis data center fallback: {NormalizeItemName(itemName)}");
+      return null;
+    }
+
+    if (string.IsNullOrWhiteSpace(dataCenterName))
+    {
+      Svc.Log.Warning("Could not resolve current data center for HQ Universalis fallback");
+      return null;
+    }
+
+    var marketData = await _client.GetMarketData(
+      itemId,
+      dataCenterName,
+      true,
+      cancellationToken,
+      listingCount: 100).ConfigureAwait(false);
+    var listing = marketData.Listings
+      .Where(candidate => candidate.Hq && candidate.PricePerUnit > 0)
+      .MaxBy(candidate => candidate.PricePerUnit);
+    if (listing == null)
+      return null;
+
+    Svc.Log.Information(
+      $"HQ Universalis fallback for item {itemId} on data center {dataCenterName}: highest HQ price is {listing.PricePerUnit}");
+    var price = (int)Math.Min(listing.PricePerUnit, int.MaxValue);
+    return new UniversalisPriceResult(price, price);
+  }
+
+  public async Task<Dictionary<UniversalisItemKey, List<UniversalisPriceResult>>> GetPrices(
+    IReadOnlyCollection<RetainerMarketItem> items,
+    string worldName,
+    CancellationToken cancellationToken)
+  {
     if (string.IsNullOrWhiteSpace(worldName))
       throw new InvalidOperationException("Could not resolve current world for Universalis batch price check.");
 

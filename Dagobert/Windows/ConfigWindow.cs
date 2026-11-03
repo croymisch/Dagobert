@@ -246,7 +246,7 @@ public sealed class ConfigWindow : Window
     }
 
     var enableAutoSelling = Plugin.Configuration.EnableAutoSelling;
-    if (ImGui.Checkbox("Automatically sell protected items during Auto Pinch", ref enableAutoSelling))
+    if (ImGui.Checkbox("Automatically sell eligible items during Auto Pinch", ref enableAutoSelling))
     {
       Plugin.Configuration.EnableAutoSelling = enableAutoSelling;
       Plugin.Configuration.Save();
@@ -254,7 +254,7 @@ public sealed class ConfigWindow : Window
     if (ImGui.IsItemHovered())
     {
       ImGui.BeginTooltip();
-      ImGui.SetTooltip("When enabled, Auto Pinch only lists items on AutoRetainer's protection list and only when their price meets the minimum.");
+      ImGui.SetTooltip("When enabled, Auto Pinch lists non-stackable, equippable, tradeable items found in regular inventory, when their price meets the minimum.");
       ImGui.EndTooltip();
     }
 
@@ -273,7 +273,7 @@ public sealed class ConfigWindow : Window
     if (ImGui.IsItemHovered())
     {
       ImGui.BeginTooltip();
-      ImGui.SetTooltip("Every non-stackable item priced below this amount is left in inventory and skipped for the rest of the Auto Pinch run. Only protected items can be automatically listed.");
+      ImGui.SetTooltip("Items priced below this amount are left in inventory and skipped for the rest of the Auto Pinch run. Eligible inventory items are listed only when their price meets this minimum.");
       ImGui.EndTooltip();
     }
 
